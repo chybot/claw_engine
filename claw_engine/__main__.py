@@ -10,6 +10,8 @@ from claw_engine.adapters.backends.codex.backend import CodexCliBackend
 def _build_registry() -> EngineRegistry:
     reg = EngineRegistry()
     reg.register_backend("codex", lambda: CodexCliBackend())
+    from claw_engine.adapters.backends.claude.backend import ClaudeCodeBackend
+    reg.register_backend("claude", lambda: ClaudeCodeBackend())
     # 仅用于 smoke：内置一个 echo 假后端（不依赖真实 CLI）
     from claw_engine.engine.runtime.contracts import (
         AgentEvent, AgentEventKind, AgentRunResult, TokenUsage,
