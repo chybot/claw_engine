@@ -15,8 +15,8 @@ class WorkspaceConversationGateway:
 
     def handle(self, *, workspace_id: str, channel: str, external_thread_key: str,
                text: str, backend_name: str, message_id: Optional[str] = None,
-               model: Optional[str] = None) -> AgentRunResult:
-        ws = self._resolver.resolve(workspace_id)
+               model: Optional[str] = None, user_id: Optional[str] = None) -> AgentRunResult:
+        ws = self._resolver.resolve(workspace_id, user_id)
         return self._conversation.handle(
             workspace_id=workspace_id, channel=channel, external_thread_key=external_thread_key,
             text=text, cwd=ws.cwd, env=ws.env,

@@ -1,6 +1,6 @@
 # claw_engine/engine/channels/routing.py
 from __future__ import annotations
-from claw_engine.engine.channels.contracts import IncomingMessage
+from claw_engine.engine.channels.contracts import IncomingMessage, RouteDecision
 
 
 class StaticWorkspaceRouter:
@@ -9,5 +9,5 @@ class StaticWorkspaceRouter:
     def __init__(self, workspace_id: str) -> None:
         self._workspace_id = workspace_id
 
-    def route(self, message: IncomingMessage) -> str:
-        return self._workspace_id
+    def route(self, message: IncomingMessage) -> RouteDecision:
+        return RouteDecision(workspace_id=self._workspace_id, user_id=None)

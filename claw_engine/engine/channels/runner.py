@@ -19,11 +19,12 @@ class ChannelRunner:
     def handle_raw(self, raw: str, headers: Mapping[str, str]) -> AgentRunResult:
         self._gateway.verify_inbound(raw, headers)        # 失败抛 InboundAuthError，阻断后续
         msg = self._gateway.parse_inbound(raw)
-        workspace_id = self._router.route(msg)
+        decision = self._router.route(msg)
         result = self._conversation.handle(
-            workspace_id=workspace_id, channel=msg.channel,
+            workspace_id=decision.workspace_id, channel=msg.channel,
             external_thread_key=msg.external_thread_key, text=msg.text,
             backend_name=self._default_backend, message_id=msg.message_id,
+            user_id=decision.user_id,
         )
         target = ReplyTarget(channel=msg.channel, external_thread_key=msg.external_thread_key,
                              raw_user_ref=msg.raw_user_ref)

@@ -19,6 +19,12 @@ class IncomingMessage:
 
 
 @dataclass(frozen=True)
+class RouteDecision:
+    workspace_id: str
+    user_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ReplyTarget:
     channel: str
     external_thread_key: str
@@ -47,6 +53,6 @@ class MessagingGateway(Protocol):
 
 @runtime_checkable
 class WorkspaceRouter(Protocol):
-    def route(self, message: IncomingMessage) -> str:
-        """IncomingMessage -> workspace_id。P6a 占位实现固定返回；P6b 用 IdentityProvider 解析。"""
+    def route(self, message: IncomingMessage) -> "RouteDecision":
+        """IncomingMessage -> 路由决策(workspace_id + 可选 user_id)。"""
         ...

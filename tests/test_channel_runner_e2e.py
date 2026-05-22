@@ -48,4 +48,6 @@ def test_static_router_returns_fixed_workspace():
     from claw_engine.engine.channels.contracts import IncomingMessage
     r = StaticWorkspaceRouter("wsX")
     msg = IncomingMessage(channel="webhook", raw_user_ref="u", external_thread_key="t", text="hi")
-    assert r.route(msg) == "wsX"
+    decision = r.route(msg)
+    assert decision.workspace_id == "wsX"
+    assert decision.user_id is None
