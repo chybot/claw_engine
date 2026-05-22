@@ -8,6 +8,13 @@ from claw_engine.engine.workflows.contracts import (
 from claw_engine.engine.workflows.executor import InlineExecutor
 
 
+class WorkflowNotTerminal(RuntimeError):
+    def __init__(self, run_id: str, status: WorkflowStatus) -> None:
+        super().__init__(f"run {run_id} 处于 {status.value}，仅终态(success/failed)可 rerun")
+        self.run_id = run_id
+        self.status = status
+
+
 class WorkflowService:
     def __init__(self, registry: EngineRegistry, store: WorkflowStore,
                  executor: Optional[WorkflowExecutor] = None) -> None:
@@ -26,6 +33,12 @@ class WorkflowService:
 
     def get(self, run_id: str) -> WorkflowRun:
         return self._store.get(run_id)
+
+    def rerun(self, run_id: str) -> WorkflowRun:
+        old = self._store.get(run_id)   # 不存在则抛 WorkflowRunNotFound
+        if old.status not in (WorkflowStatus.SUCCESS, WorkflowStatus.FAILED):
+            raise WorkflowNotTerminal(run_id, old.status)   # 正在跑/排队中不允许 rerun
+        return self.run(old.name, old.params, rerun_of=run_id)
 
     def _execute(self, run_id: str, handler: WorkflowHandler) -> None:
         self._store.save(self._store.get(run_id).with_status(WorkflowStatus.RUNNING))
