@@ -1,5 +1,5 @@
 from claw_engine.adapters.backends.claude.backend import ClaudeCodeBackend
-from claw_engine.engine.runtime.contracts import AgentRunRequest, AgentEventKind
+from claw_engine.engine.runtime.contracts import AgentRunRequest, AgentEventKind, AgentErrorKind
 
 SUCCESS_LINES = [
     '{"type":"system","subtype":"init","session_id":"sess_abc","model":"claude-x"}',
@@ -47,3 +47,77 @@ def test_claude_capabilities_are_honest():
     assert caps.supports_streaming is False
     assert caps.supports_tools is True
     assert caps.supports_mcp is False   # V1 不接 --mcp-config，不虚标
+
+
+# ---------------------------------------------------------------------------
+# Task 4: behavior-lock (schema-guard regression tests)
+# ---------------------------------------------------------------------------
+
+
+def _events(lines):
+    backend = ClaudeCodeBackend(spawn=_spawn_factory(lines))
+    return list(backend.run(AgentRunRequest(prompt="hi", cwd="/tmp", env={})))
+
+
+def test_claude_init_missing_session_id_is_protocol():
+    ev = _events(['{"type":"system","subtype":"init","model":"x"}'])
+    assert ev[-1].error.kind is AgentErrorKind.PROTOCOL
+
+
+def test_claude_assistant_missing_content_is_protocol():
+    ev = _events([
+        '{"type":"system","subtype":"init","session_id":"s1"}',
+        '{"type":"assistant","message":{}}',
+    ])
+    assert ev[-1].error.kind is AgentErrorKind.PROTOCOL
+
+
+def test_claude_tool_use_missing_name_is_protocol():
+    ev = _events([
+        '{"type":"system","subtype":"init","session_id":"s1"}',
+        '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t","input":{}}]}}',
+    ])
+    assert ev[-1].error.kind is AgentErrorKind.PROTOCOL
+
+
+def test_claude_result_error_maps_to_backend_crash():
+    ev = _events([
+        '{"type":"system","subtype":"init","session_id":"s1"}',
+        '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s1"}',
+    ])
+    assert ev[-1].error.kind is AgentErrorKind.BACKEND_CRASH
+
+
+def test_claude_unknown_type_is_ignored_forward_compat():
+    ev = _events([
+        '{"type":"system","subtype":"init","session_id":"s1"}',
+        '{"type":"some_future_event","x":1}',
+        '{"type":"assistant","message":{"content":[{"type":"thinking","text":"hmm"}]}}',
+        '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s1"}',
+    ])
+    assert ev[-1].kind is AgentEventKind.TURN_COMPLETED
+    assert ev[-1].result.final_text == "done"
+
+
+def test_claude_stream_without_result_is_protocol():
+    ev = _events([
+        '{"type":"system","subtype":"init","session_id":"s1"}',
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}',
+    ])
+    assert ev[-1].error.kind is AgentErrorKind.PROTOCOL
+
+
+def test_claude_result_missing_session_id_is_protocol():
+    ev = _events([
+        '{"type":"system","subtype":"init","session_id":"s1"}',
+        '{"type":"result","subtype":"success","is_error":false,"result":"done"}',
+    ])
+    assert ev[-1].error.kind is AgentErrorKind.PROTOCOL
+
+
+def test_claude_result_session_id_mismatch_is_protocol():
+    ev = _events([
+        '{"type":"system","subtype":"init","session_id":"s1"}',
+        '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s2"}',
+    ])
+    assert ev[-1].error.kind is AgentErrorKind.PROTOCOL
