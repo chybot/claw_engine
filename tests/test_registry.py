@@ -18,3 +18,12 @@ def test_resolve_is_fresh_instance():
     reg = EngineRegistry()
     reg.register_backend("fake", lambda: FakeBackend())
     assert reg.resolve_backend("fake") is not reg.resolve_backend("fake")
+
+def test_register_and_resolve_workflow():
+    from claw_engine.engine.bootstrap import EngineRegistry, WorkflowNotRegistered
+    reg = EngineRegistry()
+    reg.register_workflow("wf", lambda params, ctx: "ok")
+    assert reg.resolve_workflow("wf")({}, None) == "ok"
+    import pytest
+    with pytest.raises(WorkflowNotRegistered):
+        reg.resolve_workflow("missing")

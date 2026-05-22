@@ -2,9 +2,14 @@
 from __future__ import annotations
 from typing import Callable, Dict
 from claw_engine.engine.runtime.contracts import CodeAgentBackend
+from claw_engine.engine.workflows.contracts import WorkflowHandler
 
 
 class BackendNotRegistered(KeyError):
+    pass
+
+
+class WorkflowNotRegistered(KeyError):
     pass
 
 
@@ -13,6 +18,7 @@ class EngineRegistry:
 
     def __init__(self) -> None:
         self._backends: Dict[str, Callable[[], CodeAgentBackend]] = {}
+        self._workflows: Dict[str, WorkflowHandler] = {}
 
     def register_backend(self, name: str, factory: Callable[[], CodeAgentBackend]) -> None:
         self._backends[name] = factory
@@ -23,3 +29,12 @@ class EngineRegistry:
         except KeyError:
             raise BackendNotRegistered(name) from None
         return factory()
+
+    def register_workflow(self, name: str, handler: WorkflowHandler) -> None:
+        self._workflows[name] = handler
+
+    def resolve_workflow(self, name: str) -> WorkflowHandler:
+        try:
+            return self._workflows[name]
+        except KeyError:
+            raise WorkflowNotRegistered(name) from None
