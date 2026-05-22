@@ -2,49 +2,13 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-import threading
-from typing import Callable, Iterator, Mapping, Optional, Tuple
+from typing import Iterator, Optional
 from claw_engine.engine.runtime.contracts import (
-    AgentEvent, AgentEventKind, AgentError, AgentErrorKind, AgentRunRequest,
+    AgentEvent, AgentEventKind, AgentRunRequest,
     AgentRunResult, BackendCapabilities, BackendHealth, ToolEvent, TokenUsage,
 )
-
-# spawn(argv, cwd, env, timeout_s) -> (stdout 行迭代器, 取退出码的可调用)
-SpawnFn = Callable[[list, str, Mapping[str, str], int], Tuple[Iterator[str], Callable[[], int]]]
-
-
-def _protocol_error(message: str, raw: Optional[dict] = None) -> AgentEvent:
-    return AgentEvent(
-        kind=AgentEventKind.ERROR,
-        error=AgentError(kind=AgentErrorKind.PROTOCOL, message=message, retriable=False, raw=raw),
-    )
-
-
-def _default_spawn(argv, cwd, env, timeout_s):
-    proc = subprocess.Popen(argv, cwd=cwd, env=dict(env), stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True)
-    timed_out = {"flag": False}
-
-    def _on_timeout() -> None:
-        timed_out["flag"] = True
-        proc.kill()  # 解除 stdout 读阻塞
-
-    timer = threading.Timer(timeout_s, _on_timeout)
-    timer.daemon = True
-    timer.start()
-
-    def lines() -> Iterator[str]:
-        try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                yield line.rstrip("\n")
-        finally:
-            timer.cancel()
-            proc.wait()
-        if timed_out["flag"]:
-            raise subprocess.TimeoutExpired(argv, timeout_s)
-
-    return lines(), (lambda: proc.returncode if proc.returncode is not None else 0)
+from claw_engine.adapters.backends._subprocess import SpawnFn, default_spawn
+from claw_engine.adapters.backends._errors import protocol_error, timeout_error, crash_error
 
 
 class CodexCliBackend:
@@ -52,7 +16,7 @@ class CodexCliBackend:
 
     def __init__(self, command: str = "codex", spawn: Optional[SpawnFn] = None) -> None:
         self._command = command
-        self._spawn = spawn or _default_spawn
+        self._spawn = spawn or default_spawn
 
     def capabilities(self) -> BackendCapabilities:
         return BackendCapabilities(
@@ -87,13 +51,13 @@ class CodexCliBackend:
                     evt = json.loads(raw_line)
                 except json.JSONDecodeError:
                     # 非 JSON / 解析失败 = 协议破损，立即终止
-                    yield _protocol_error(f"无法解析 codex 输出行: {raw_line[:200]!r}")
+                    yield protocol_error(f"无法解析 codex 输出行: {raw_line[:200]!r}")
                     return
                 etype = evt.get("type")
                 if etype == "thread.started":
                     tid = evt.get("thread_id")
                     if not tid:
-                        yield _protocol_error("thread.started 缺少 thread_id", evt)
+                        yield protocol_error("thread.started 缺少 thread_id", evt)
                         return
                     thread_id = tid
                     yield AgentEvent(kind=AgentEventKind.THREAD_STARTED,
@@ -101,13 +65,13 @@ class CodexCliBackend:
                 elif etype == "item.completed":
                     item = evt.get("item")
                     if not isinstance(item, dict) or not item.get("type"):
-                        yield _protocol_error("item.completed 缺少 item.type", evt)
+                        yield protocol_error("item.completed 缺少 item.type", evt)
                         return
                     itype = item["type"]
                     if itype == "tool_call":
                         name = item.get("name")
                         if not name:
-                            yield _protocol_error("tool_call 缺少 name", evt)
+                            yield protocol_error("tool_call 缺少 name", evt)
                             return
                         yield AgentEvent(
                             kind=AgentEventKind.TOOL_CALL_COMPLETED,
@@ -117,7 +81,7 @@ class CodexCliBackend:
                         )
                     elif itype == "agent_message":
                         if "text" not in item:
-                            yield _protocol_error("agent_message 缺少 text", evt)
+                            yield protocol_error("agent_message 缺少 text", evt)
                             return
                         final_text = item.get("text") or ""
                         yield AgentEvent(kind=AgentEventKind.MESSAGE_COMPLETED,
@@ -126,25 +90,13 @@ class CodexCliBackend:
                 # 未知顶层 type → 前向兼容忽略
             code = returncode()
         except subprocess.TimeoutExpired:
-            yield AgentEvent(
-                kind=AgentEventKind.ERROR,
-                error=AgentError(kind=AgentErrorKind.TIMEOUT,
-                                 message=f"codex 读取超时 ({req.timeout_s}s)", retriable=True),
-            )
+            yield timeout_error(f"codex 读取超时 ({req.timeout_s}s)")
             return
         except (OSError, subprocess.SubprocessError) as exc:
-            yield AgentEvent(
-                kind=AgentEventKind.ERROR,
-                error=AgentError(kind=AgentErrorKind.BACKEND_CRASH,
-                                 message=f"codex 子进程异常: {exc}", retriable=False),
-            )
+            yield crash_error(f"codex 子进程异常: {exc}")
             return
         if code != 0:
-            yield AgentEvent(
-                kind=AgentEventKind.ERROR,
-                error=AgentError(kind=AgentErrorKind.BACKEND_CRASH,
-                                 message=f"codex exited with {code}", retriable=False),
-            )
+            yield crash_error(f"codex exited with {code}")
             return
         yield AgentEvent(
             kind=AgentEventKind.TURN_COMPLETED,
