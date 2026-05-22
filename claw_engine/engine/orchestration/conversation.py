@@ -1,6 +1,6 @@
 # claw_engine/engine/orchestration/conversation.py
 from __future__ import annotations
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 from claw_engine.engine.orchestration.engine import Engine
 from claw_engine.engine.persistence.contracts import SessionStore
 from claw_engine.engine.runtime.contracts import AgentRunResult
@@ -32,7 +32,8 @@ class ConversationService:
     def handle(self, *, workspace_id: str, channel: str, external_thread_key: str,
                text: str, cwd: str, env: Mapping[str, str], backend_name: str,
                max_rounds: int = DEFAULT_MAX_ROUNDS, message_id: Optional[str] = None,
-               model: Optional[str] = None) -> AgentRunResult:
+               model: Optional[str] = None, user_id: Optional[str] = None,
+               trace_metadata: Optional[Mapping[str, Any]] = None) -> AgentRunResult:
         session = self._store.get_or_create(
             workspace_id=workspace_id, channel=channel, external_thread_key=external_thread_key,
             backend_name=backend_name, max_rounds=max_rounds,
@@ -42,11 +43,17 @@ class ConversationService:
         if session.round_count >= session.max_rounds:
             raise SessionRoundsExceeded(session.session_id, session.max_rounds)
 
+        metadata = {
+            "workspace_id": workspace_id,
+            "session_id": session.session_id,
+            "channel": channel,
+            "user_id": user_id,
+        }
         result = self._engine.run_turn(
             backend_name=session.backend_name, prompt=text, cwd=cwd, env=env,
             backend_thread_id=session.backend_thread_id, model=model,
-            metadata={"workspace_id": workspace_id, "session_id": session.session_id,
-                      "channel": channel},
+            metadata=metadata,
+            trace_metadata=trace_metadata,  # 二者分离：trace_metadata 给 tracer
         )
 
         self._store.save(session.with_turn(backend_thread_id=result.backend_thread_id))

@@ -23,4 +23,6 @@ class WorkspaceConversationGateway:
             backend_name=ws.backend_name or backend_name,   # workspace 指定的 backend 优先
             max_rounds=ws.max_rounds or DEFAULT_MAX_ROUNDS,
             message_id=message_id, model=model,
+            user_id=user_id,
+            trace_metadata={"redacted_env": ws.redacted_env()},   # 脱敏 env 进 trace metadata
         )
