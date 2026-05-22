@@ -3,7 +3,7 @@ import dataclasses
 import pytest
 from claw_engine.engine.runtime.contracts import (
     AgentEvent, AgentEventKind, AgentRunRequest, AgentRunResult,
-    AgentError, AgentErrorKind, BackendCapabilities, ToolEvent, TokenUsage,
+    AgentError, AgentErrorKind, BackendCapabilities, TokenUsage,
 )
 
 def test_request_is_frozen():

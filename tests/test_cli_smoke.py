@@ -1,4 +1,5 @@
-import subprocess, sys
+import subprocess
+import sys
 
 def test_cli_runs_one_turn_with_fake_backend():
     out = subprocess.run(
