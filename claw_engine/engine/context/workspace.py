@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Mapping, Optional
 from claw_engine.engine.context.config import ConfigProvider
 from claw_engine.engine.context.secrets import SecretProvider, redact
+from claw_engine.engine.context.user_config import UserConfigProvider
 
 _WORKSPACE_ID_RE = re.compile(r"[A-Za-z0-9_.-]+")
 
@@ -54,17 +55,21 @@ class WorkspaceResolver:
 
     def __init__(self, config: ConfigProvider, secrets: SecretProvider, *,
                  workspaces_root: str,
-                 specs: Optional[Mapping[str, WorkspaceSpec]] = None) -> None:
+                 specs: Optional[Mapping[str, WorkspaceSpec]] = None,
+                 user_config: Optional[UserConfigProvider] = None) -> None:
         self._config = config
         self._secrets = secrets
         self._root = workspaces_root
         self._specs = dict(specs or {})
+        self._user_config = user_config
 
-    def resolve(self, workspace_id: str) -> ResolvedWorkspace:
-        _validate_workspace_id(workspace_id)                   # 防路径穿越
-        base_env = dict(self._config.get_env(workspace_id))    # global + workspace（workspace wins）
+    def resolve(self, workspace_id: str, user_id: Optional[str] = None) -> ResolvedWorkspace:
+        _validate_workspace_id(workspace_id)                        # 防路径穿越
+        base_env = dict(self._config.get_env(workspace_id))        # global + workspace（workspace wins）
+        if user_id is not None and self._user_config is not None:
+            base_env.update(self._user_config.get_env(user_id, workspace_id))  # user×workspace 覆盖
         secret_env = dict(self._secrets.get_secrets(workspace_id))
-        env = {**base_env, **secret_env}                       # secret 最后叠加（同名覆盖）
+        env = {**base_env, **secret_env}                            # secret 最高
         spec = self._specs.get(workspace_id, WorkspaceSpec())
         return ResolvedWorkspace(
             workspace_id=workspace_id,
