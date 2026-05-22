@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
 from typing import Callable, Iterator, Mapping, Optional, Tuple
 from claw_engine.engine.runtime.contracts import (
     AgentEvent, AgentEventKind, AgentError, AgentErrorKind, AgentRunRequest,
@@ -22,11 +23,27 @@ def _protocol_error(message: str, raw: Optional[dict] = None) -> AgentEvent:
 def _default_spawn(argv, cwd, env, timeout_s):
     proc = subprocess.Popen(argv, cwd=cwd, env=dict(env), stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, text=True)
+    timed_out = {"flag": False}
+
+    def _on_timeout() -> None:
+        timed_out["flag"] = True
+        proc.kill()  # 解除 stdout 读阻塞
+
+    timer = threading.Timer(timeout_s, _on_timeout)
+    timer.daemon = True
+    timer.start()
+
     def lines() -> Iterator[str]:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            yield line.rstrip("\n")
-        proc.wait(timeout=timeout_s)
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                yield line.rstrip("\n")
+        finally:
+            timer.cancel()
+            proc.wait()
+        if timed_out["flag"]:
+            raise subprocess.TimeoutExpired(argv, timeout_s)
+
     return lines(), (lambda: proc.returncode if proc.returncode is not None else 0)
 
 
@@ -62,51 +79,66 @@ class CodexCliBackend:
         line_iter, returncode = self._spawn(argv, req.cwd, req.env, req.timeout_s)
         thread_id = req.backend_thread_id
         final_text = ""
-        for raw_line in line_iter:
-            if not raw_line.strip():
-                continue
-            try:
-                evt = json.loads(raw_line)
-            except json.JSONDecodeError:
-                # 非 JSON / 解析失败 = 协议破损，立即终止
-                yield _protocol_error(f"无法解析 codex 输出行: {raw_line[:200]!r}")
-                return
-            etype = evt.get("type")
-            if etype == "thread.started":
-                tid = evt.get("thread_id")
-                if not tid:
-                    yield _protocol_error("thread.started 缺少 thread_id", evt)
+        try:
+            for raw_line in line_iter:
+                if not raw_line.strip():
+                    continue
+                try:
+                    evt = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    # 非 JSON / 解析失败 = 协议破损，立即终止
+                    yield _protocol_error(f"无法解析 codex 输出行: {raw_line[:200]!r}")
                     return
-                thread_id = tid
-                yield AgentEvent(kind=AgentEventKind.THREAD_STARTED,
-                                 backend_thread_id=thread_id, raw=evt)
-            elif etype == "item.completed":
-                item = evt.get("item")
-                if not isinstance(item, dict) or not item.get("type"):
-                    yield _protocol_error("item.completed 缺少 item.type", evt)
-                    return
-                itype = item["type"]
-                if itype == "tool_call":
-                    name = item.get("name")
-                    if not name:
-                        yield _protocol_error("tool_call 缺少 name", evt)
+                etype = evt.get("type")
+                if etype == "thread.started":
+                    tid = evt.get("thread_id")
+                    if not tid:
+                        yield _protocol_error("thread.started 缺少 thread_id", evt)
                         return
-                    yield AgentEvent(
-                        kind=AgentEventKind.TOOL_CALL_COMPLETED,
-                        tool=ToolEvent(name=name, input=item.get("input"),
-                                       output=item.get("output")),
-                        raw=evt,
-                    )
-                elif itype == "agent_message":
-                    if "text" not in item:
-                        yield _protocol_error("agent_message 缺少 text", evt)
+                    thread_id = tid
+                    yield AgentEvent(kind=AgentEventKind.THREAD_STARTED,
+                                     backend_thread_id=thread_id, raw=evt)
+                elif etype == "item.completed":
+                    item = evt.get("item")
+                    if not isinstance(item, dict) or not item.get("type"):
+                        yield _protocol_error("item.completed 缺少 item.type", evt)
                         return
-                    final_text = item.get("text") or ""
-                    yield AgentEvent(kind=AgentEventKind.MESSAGE_COMPLETED,
-                                     text=final_text, raw=evt)
-                # 已知 item.completed 但未知 item.type → 前向兼容忽略
-            # 未知顶层 type → 前向兼容忽略
-        code = returncode()
+                    itype = item["type"]
+                    if itype == "tool_call":
+                        name = item.get("name")
+                        if not name:
+                            yield _protocol_error("tool_call 缺少 name", evt)
+                            return
+                        yield AgentEvent(
+                            kind=AgentEventKind.TOOL_CALL_COMPLETED,
+                            tool=ToolEvent(name=name, input=item.get("input"),
+                                           output=item.get("output")),
+                            raw=evt,
+                        )
+                    elif itype == "agent_message":
+                        if "text" not in item:
+                            yield _protocol_error("agent_message 缺少 text", evt)
+                            return
+                        final_text = item.get("text") or ""
+                        yield AgentEvent(kind=AgentEventKind.MESSAGE_COMPLETED,
+                                         text=final_text, raw=evt)
+                    # 已知 item.completed 但未知 item.type → 前向兼容忽略
+                # 未知顶层 type → 前向兼容忽略
+            code = returncode()
+        except subprocess.TimeoutExpired:
+            yield AgentEvent(
+                kind=AgentEventKind.ERROR,
+                error=AgentError(kind=AgentErrorKind.TIMEOUT,
+                                 message=f"codex 读取超时 ({req.timeout_s}s)", retriable=True),
+            )
+            return
+        except (OSError, subprocess.SubprocessError) as exc:
+            yield AgentEvent(
+                kind=AgentEventKind.ERROR,
+                error=AgentError(kind=AgentErrorKind.BACKEND_CRASH,
+                                 message=f"codex 子进程异常: {exc}", retriable=False),
+            )
+            return
         if code != 0:
             yield AgentEvent(
                 kind=AgentEventKind.ERROR,

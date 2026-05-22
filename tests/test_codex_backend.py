@@ -1,3 +1,5 @@
+import subprocess
+
 from claw_engine.adapters.backends.codex.backend import CodexCliBackend
 from claw_engine.engine.runtime.contracts import AgentRunRequest, AgentEventKind, AgentErrorKind
 from claw_engine.engine.runtime.contract_suite import assert_valid_event_stream
@@ -86,3 +88,36 @@ def test_codex_unknown_type_is_ignored_forward_compat():
     assert_valid_event_stream(events)
     assert events[-1].kind is AgentEventKind.TURN_COMPLETED
     assert events[-1].result.final_text == "done"
+
+
+# --- contract hardening: timeout / subprocess exception normalization ---
+
+class _RaisingIter:
+    """读 stdout 阶段抛异常的迭代器（模拟超时/子进程崩溃）。"""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def __iter__(self) -> "_RaisingIter":
+        return self
+
+    def __next__(self) -> str:
+        raise self._exc
+
+def test_codex_timeout_maps_to_error():
+    def spawn(argv, cwd, env, timeout_s):
+        return _RaisingIter(subprocess.TimeoutExpired(argv, timeout_s)), (lambda: 0)
+    backend = CodexCliBackend(spawn=spawn)
+    events = list(backend.run(AgentRunRequest(prompt="hi", cwd="/tmp", env={}, timeout_s=1)))
+    assert_valid_event_stream(events)
+    assert events[-1].kind is AgentEventKind.ERROR
+    assert events[-1].error.kind is AgentErrorKind.TIMEOUT
+
+def test_codex_subprocess_exception_maps_to_backend_crash():
+    def spawn(argv, cwd, env, timeout_s):
+        return _RaisingIter(OSError("broken pipe")), (lambda: 0)
+    backend = CodexCliBackend(spawn=spawn)
+    events = list(backend.run(AgentRunRequest(prompt="hi", cwd="/tmp", env={})))
+    assert_valid_event_stream(events)
+    assert events[-1].kind is AgentEventKind.ERROR
+    assert events[-1].error.kind is AgentErrorKind.BACKEND_CRASH
