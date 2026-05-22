@@ -1,5 +1,5 @@
 from claw_engine.adapters.backends.codex.backend import CodexCliBackend
-from claw_engine.engine.runtime.contracts import AgentRunRequest, AgentEventKind
+from claw_engine.engine.runtime.contracts import AgentRunRequest, AgentEventKind, AgentErrorKind
 from claw_engine.engine.runtime.contract_suite import assert_valid_event_stream
 
 CANNED_OK = [
@@ -39,3 +39,50 @@ def test_codex_resume_passes_thread_id_in_argv():
     list(backend.run(AgentRunRequest(prompt="hi", cwd="/tmp", env={}, backend_thread_id="th_9")))
     assert "resume" in captured["argv"]
     assert "th_9" in captured["argv"]
+
+
+# --- contract hardening: PROTOCOL detection ---
+
+CANNED_MALFORMED = [
+    '{"type":"thread.started","thread_id":"th_1"}',
+    'not json at all {{{',
+    '{"type":"item.completed","item":{"type":"agent_message","text":"unreachable"}}',
+]
+
+def test_codex_malformed_json_maps_to_protocol_error():
+    backend = CodexCliBackend(spawn=_spawn_factory(CANNED_MALFORMED))
+    events = list(backend.run(AgentRunRequest(prompt="hi", cwd="/tmp", env={})))
+    assert_valid_event_stream(events)
+    assert events[-1].kind is AgentEventKind.ERROR
+    assert events[-1].error.kind is AgentErrorKind.PROTOCOL
+    # malformed 之后立即终止，不得降级成功终态
+    assert not any(e.kind is AgentEventKind.TURN_COMPLETED for e in events)
+
+def test_codex_thread_started_missing_thread_id_is_protocol_error():
+    backend = CodexCliBackend(spawn=_spawn_factory(['{"type":"thread.started"}']))
+    events = list(backend.run(AgentRunRequest(prompt="hi", cwd="/tmp", env={})))
+    assert_valid_event_stream(events)
+    assert events[-1].error.kind is AgentErrorKind.PROTOCOL
+
+def test_codex_item_completed_missing_type_is_protocol_error():
+    lines = [
+        '{"type":"thread.started","thread_id":"th_1"}',
+        '{"type":"item.completed","item":{"name":"shell"}}',
+    ]
+    backend = CodexCliBackend(spawn=_spawn_factory(lines))
+    events = list(backend.run(AgentRunRequest(prompt="hi", cwd="/tmp", env={})))
+    assert_valid_event_stream(events)
+    assert events[-1].error.kind is AgentErrorKind.PROTOCOL
+
+def test_codex_unknown_type_is_ignored_forward_compat():
+    lines = [
+        '{"type":"thread.started","thread_id":"th_1"}',
+        '{"type":"some.future.event","payload":123}',
+        '{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+    ]
+    backend = CodexCliBackend(spawn=_spawn_factory(lines))
+    events = list(backend.run(AgentRunRequest(prompt="hi", cwd="/tmp", env={})))
+    assert_valid_event_stream(events)
+    assert events[-1].kind is AgentEventKind.TURN_COMPLETED
+    assert events[-1].result.final_text == "done"

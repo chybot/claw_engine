@@ -12,6 +12,13 @@ from claw_engine.engine.runtime.contracts import (
 SpawnFn = Callable[[list, str, Mapping[str, str], int], Tuple[Iterator[str], Callable[[], int]]]
 
 
+def _protocol_error(message: str, raw: Optional[dict] = None) -> AgentEvent:
+    return AgentEvent(
+        kind=AgentEventKind.ERROR,
+        error=AgentError(kind=AgentErrorKind.PROTOCOL, message=message, retriable=False, raw=raw),
+    )
+
+
 def _default_spawn(argv, cwd, env, timeout_s):
     proc = subprocess.Popen(argv, cwd=cwd, env=dict(env), stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, text=True)
@@ -61,26 +68,44 @@ class CodexCliBackend:
             try:
                 evt = json.loads(raw_line)
             except json.JSONDecodeError:
-                continue  # 非 JSON 行跳过
+                # 非 JSON / 解析失败 = 协议破损，立即终止
+                yield _protocol_error(f"无法解析 codex 输出行: {raw_line[:200]!r}")
+                return
             etype = evt.get("type")
             if etype == "thread.started":
-                thread_id = evt.get("thread_id") or thread_id
+                tid = evt.get("thread_id")
+                if not tid:
+                    yield _protocol_error("thread.started 缺少 thread_id", evt)
+                    return
+                thread_id = tid
                 yield AgentEvent(kind=AgentEventKind.THREAD_STARTED,
                                  backend_thread_id=thread_id, raw=evt)
             elif etype == "item.completed":
-                item = evt.get("item") or {}
-                itype = item.get("type")
+                item = evt.get("item")
+                if not isinstance(item, dict) or not item.get("type"):
+                    yield _protocol_error("item.completed 缺少 item.type", evt)
+                    return
+                itype = item["type"]
                 if itype == "tool_call":
+                    name = item.get("name")
+                    if not name:
+                        yield _protocol_error("tool_call 缺少 name", evt)
+                        return
                     yield AgentEvent(
                         kind=AgentEventKind.TOOL_CALL_COMPLETED,
-                        tool=ToolEvent(name=item.get("name", "tool"),
-                                       input=item.get("input"), output=item.get("output")),
+                        tool=ToolEvent(name=name, input=item.get("input"),
+                                       output=item.get("output")),
                         raw=evt,
                     )
                 elif itype == "agent_message":
-                    final_text = item.get("text", final_text)
+                    if "text" not in item:
+                        yield _protocol_error("agent_message 缺少 text", evt)
+                        return
+                    final_text = item.get("text") or ""
                     yield AgentEvent(kind=AgentEventKind.MESSAGE_COMPLETED,
                                      text=final_text, raw=evt)
+                # 已知 item.completed 但未知 item.type → 前向兼容忽略
+            # 未知顶层 type → 前向兼容忽略
         code = returncode()
         if code != 0:
             yield AgentEvent(
