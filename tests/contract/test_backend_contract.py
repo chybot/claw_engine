@@ -1,8 +1,8 @@
 import pytest
 from tests.contract import backend_contract as bc
-from tests.contract import codex_fixtures
+from tests.contract import codex_fixtures, claude_fixtures
 
-FIXTURES = [codex_fixtures.FIXTURE]
+FIXTURES = [codex_fixtures.FIXTURE, claude_fixtures.FIXTURE]
 
 
 @pytest.mark.parametrize("fx", FIXTURES, ids=lambda f: f.name)
