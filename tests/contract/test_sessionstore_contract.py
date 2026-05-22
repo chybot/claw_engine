@@ -1,8 +1,12 @@
 import pytest
 from claw_engine.engine.persistence.memory_store import MemorySessionStore
+from claw_engine.engine.persistence.sqlite_store import SqliteSessionStore
 from tests.contract import sessionstore_contract as sc
 
-STORES = [("memory", lambda: MemorySessionStore())]
+STORES = [
+    ("memory", lambda: MemorySessionStore()),
+    ("sqlite", lambda: SqliteSessionStore(":memory:")),
+]
 
 @pytest.mark.parametrize("name,make_store", STORES, ids=[n for n, _ in STORES])
 def test_get_or_create_idempotent(name, make_store):
