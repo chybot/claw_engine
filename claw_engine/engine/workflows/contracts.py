@@ -30,6 +30,7 @@ class WorkflowRun:
     result: Optional[Any] = None
     error: Optional[str] = None
     rerun_of: Optional[str] = None
+    owner_workspace_id: Optional[str] = None
     created_at: float = 0.0
     updated_at: float = 0.0
 

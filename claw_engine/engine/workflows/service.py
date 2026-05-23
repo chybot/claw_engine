@@ -23,10 +23,12 @@ class WorkflowService:
         self._executor = executor or InlineExecutor()
 
     def run(self, name: str, params: Optional[Mapping[str, Any]] = None, *,
-            rerun_of: Optional[str] = None) -> WorkflowRun:
+            rerun_of: Optional[str] = None,
+            owner_workspace_id: Optional[str] = None) -> WorkflowRun:
         handler = self._registry.resolve_workflow(name)   # 未注册即抛 WorkflowNotRegistered
         run = WorkflowRun(run_id=uuid.uuid4().hex, name=name, params=dict(params or {}),
-                          status=WorkflowStatus.PENDING, rerun_of=rerun_of)
+                          status=WorkflowStatus.PENDING, rerun_of=rerun_of,
+                          owner_workspace_id=owner_workspace_id)
         self._store.save(run)
         self._executor.submit(lambda: self._execute(run.run_id, handler))
         return self._store.get(run.run_id)
@@ -38,7 +40,8 @@ class WorkflowService:
         old = self._store.get(run_id)   # 不存在则抛 WorkflowRunNotFound
         if old.status not in (WorkflowStatus.SUCCESS, WorkflowStatus.FAILED):
             raise WorkflowNotTerminal(run_id, old.status)   # 正在跑/排队中不允许 rerun
-        return self.run(old.name, old.params, rerun_of=run_id)
+        return self.run(old.name, old.params, rerun_of=run_id,
+                        owner_workspace_id=old.owner_workspace_id)
 
     def _execute(self, run_id: str, handler: WorkflowHandler) -> None:
         self._store.save(self._store.get(run_id).with_status(WorkflowStatus.RUNNING))
