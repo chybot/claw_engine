@@ -67,12 +67,21 @@ class SkillProvisioner:
 
         # 撤权清理：上次本工具 provisioned 但本次不再 effective 的 skill -> 从磁盘移除
         # 关键：只清理 manifest 里记的（本工具管理的），用户自建目录绝不动
+        # 双重防御：(1) _read_manifest 已过滤非法名；(2) rmtree 前再做 realpath 包含校验
         effective = set(provisioned)
         revoked: list[str] = []
+        dest_root_real = os.path.realpath(dest_root)
         for prev_skill in sorted(prev_managed - effective):
             target = os.path.join(dest_root, prev_skill)
-            if os.path.isdir(target):
-                shutil.rmtree(target)
+            target_real = os.path.realpath(target)
+            try:
+                common = os.path.commonpath([dest_root_real, target_real])
+            except ValueError:                                  # 跨盘等无公共路径
+                continue
+            if common != dest_root_real or target_real == dest_root_real:
+                continue                                        # 越界 / 指向 dest_root 本身 -> 跳过
+            if os.path.isdir(target_real):
+                shutil.rmtree(target_real)
                 revoked.append(prev_skill)
 
         # 写新 manifest（只记录本次本工具实际管理的 skill）
@@ -85,12 +94,23 @@ class SkillProvisioner:
         return os.path.join(dest_root, _MANIFEST_FILE)
 
     def _read_manifest(self, dest_root: str) -> set:
+        """读取 manifest 并对每条 managed 做 validate_skill_name；非法项一律丢弃，
+        避免被篡改的 manifest 让撤权清理穿越到 dest_root 之外（这是 RBAC 闸口的一部分）。"""
         try:
             with open(self._manifest_path(dest_root), encoding="utf-8") as f:
                 data = json.load(f)
-            return set(data.get("managed", []))
         except (FileNotFoundError, json.JSONDecodeError):
             return set()
+        managed: set = set()
+        for entry in data.get("managed", []):
+            if not isinstance(entry, str):
+                continue
+            try:
+                validate_skill_name(entry)
+            except InvalidSkillName:
+                continue                                    # 篡改/非法名 -> 忽略
+            managed.add(entry)
+        return managed
 
     def _write_manifest(self, dest_root: str, managed: set) -> None:
         with open(self._manifest_path(dest_root), "w", encoding="utf-8") as f:
