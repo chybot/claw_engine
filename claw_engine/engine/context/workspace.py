@@ -25,6 +25,7 @@ def _validate_workspace_id(workspace_id: str) -> None:
 class WorkspaceSpec:
     """每 workspace 的静态配置（V1 内存；真实来源由 adapters 提供）。"""
     allowed_skills: tuple[str, ...] = ()
+    allowed_workflows: tuple[str, ...] = ()
     backend_name: Optional[str] = None
     max_rounds: Optional[int] = None
 
@@ -36,6 +37,7 @@ class ResolvedWorkspace:
     env: Mapping[str, str]                 # global ⊕ workspace ⊕ secrets，注入子进程
     sensitive_keys: frozenset[str]         # env 中来自 secret 的 key（脱敏依据）
     allowed_skills: tuple[str, ...] = ()   # skill visibility 数据模型（provisioning 见 P6）
+    allowed_workflows: tuple[str, ...] = ()
     backend_name: Optional[str] = None
     max_rounds: Optional[int] = None
 
@@ -46,8 +48,8 @@ class ResolvedWorkspace:
         # 自定义 repr：绝不泄露 env 明文 secret，只展示脱敏后的 env（repr=False 关掉默认实现）
         return (f"ResolvedWorkspace(workspace_id={self.workspace_id!r}, cwd={self.cwd!r}, "
                 f"env={self.redacted_env()!r}, sensitive_keys={set(self.sensitive_keys)!r}, "
-                f"allowed_skills={self.allowed_skills!r}, backend_name={self.backend_name!r}, "
-                f"max_rounds={self.max_rounds!r})")
+                f"allowed_skills={self.allowed_skills!r}, allowed_workflows={self.allowed_workflows!r}, "
+                f"backend_name={self.backend_name!r}, max_rounds={self.max_rounds!r})")
 
 
 class WorkspaceResolver:
@@ -77,6 +79,7 @@ class WorkspaceResolver:
             env=env,
             sensitive_keys=frozenset(secret_env.keys()),
             allowed_skills=spec.allowed_skills,
+            allowed_workflows=spec.allowed_workflows,
             backend_name=spec.backend_name,
             max_rounds=spec.max_rounds,
         )

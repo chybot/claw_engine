@@ -28,9 +28,17 @@ class User:
     default_workspace: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class Principal:
+    """RBAC 主体：user × workspace_id。bridge.invoke 用它做权限校验。"""
+    user: User
+    workspace_id: str
+
+
 @runtime_checkable
 class IdentityProvider(Protocol):
     def resolve_user(self, raw_user_ref: str) -> User: ...               # 未知抛 UnknownUser
     def authorized_workspaces(self, user: User) -> tuple[str, ...]: ...
     def can_access_workspace(self, user: User, workspace_id: str) -> bool: ...
     def can_use_skill(self, user: User, workspace_id: str, skill: str) -> bool: ...
+    def can_run_workflow(self, user: User, workspace_id: str, workflow: str) -> bool: ...
