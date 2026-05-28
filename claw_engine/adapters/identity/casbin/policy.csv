@@ -1,0 +1,12 @@
+# claw_engine P8c — example policy
+# Format: p, <sub>, <ws>, <obj>, <act>, <eft>
+# Default behavior is allow; only put deny rules here.
+
+# Example: alice cannot use the social-media-query skill in workspace-ads
+p, alice, workspace-ads, social-media-query, use, deny
+
+# Example: nobody can run the dangerous-cleanup workflow in workspace-prod
+p, *, workspace-prod, dangerous-cleanup, run, deny
+
+# Example: a specific user is blocked from one workflow in their default workspace
+p, bob, workspace-bob, deploy-prod, run, deny

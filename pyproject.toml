@@ -8,6 +8,7 @@ dependencies = []
 dev = ["pytest>=8", "ruff>=0.6"]
 otel = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
 skills-git = []  # no Python deps; uses system git CLI
+identity-casbin = ["casbin>=1.30"]
 
 [build-system]
 requires = ["setuptools>=68"]
