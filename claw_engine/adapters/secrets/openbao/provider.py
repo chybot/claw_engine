@@ -16,6 +16,7 @@ Token safety (HC-D):
 from __future__ import annotations
 
 import re
+import string
 from typing import Mapping
 from urllib.parse import urlparse, urlunparse
 
@@ -34,6 +35,110 @@ _ACCEPT_JSON = "application/json"
 # engine.context (deferred to a follow-up PR).
 _WORKSPACE_ID_RE = re.compile(r"[A-Za-z0-9_.-]+")
 
+# Mount is a single path segment in OpenBao URLs (/v1/<mount>/data/...).
+# Same character class as workspace_id (segment-safe), with explicit
+# '.' and '..' ban to block path traversal at the mount layer.
+_MOUNT_RE = re.compile(r"[A-Za-z0-9_.-]+")
+
+# Sentinel substituted for {workspace_id} during path_template inspection
+# so we can validate the surrounding literal segments without needing a
+# real workspace id.
+_TEMPLATE_PLACEHOLDER_SENTINEL = "__WS_PLACEHOLDER_SENTINEL__"
+
+# Characters that would change URL shape if they appeared in a literal
+# segment of path_template (query, fragment, backslash, scheme separators,
+# percent — to avoid encoded-traversal confusion).
+_UNSAFE_TEMPLATE_CHARS = frozenset("?#\\:@%")
+
+
+def _validate_mount(mount: str) -> None:
+    """Validate ``mount`` is a single safe URL path segment.
+
+    Rules:
+    - non-empty string
+    - matches ``[A-Za-z0-9_.-]+`` fully (regex disallows '/')
+    - not '.' or '..' (path-traversal ban)
+    """
+    if not mount or not isinstance(mount, str):
+        raise ValueError("mount must be a non-empty string")
+    if mount in (".", ".."):
+        raise ValueError(
+            f"mount must not be '.' or '..' (path traversal), got {mount!r}"
+        )
+    if _MOUNT_RE.fullmatch(mount) is None:
+        raise ValueError(
+            f"mount must match [A-Za-z0-9_.-]+ (single URL path segment), "
+            f"got {mount!r}"
+        )
+
+
+def _validate_path_template(template: str) -> None:
+    """Validate ``path_template`` is a well-formed URL path with exactly one
+    ``{workspace_id}`` placeholder.
+
+    Uses :class:`string.Formatter` introspection so we never substitute
+    untrusted data during validation. Rules:
+
+    1. Non-empty; no leading or trailing '/'.
+    2. Exactly one placeholder, named ``workspace_id`` (no ``{0}``, ``{}``,
+       ``{other}``, no duplicates).
+    3. Well-formed (no unclosed braces).
+    4. After sentinel substitution, no empty segment (``//``), no ``.`` or
+       ``..`` segment, and no unsafe URL chars (``?#\\:@%``) in any literal
+       segment.
+
+    The workspace_id slot itself is validated at runtime in ``get_secrets``
+    (C1) — this helper only validates the template's static structure.
+    """
+    if not template or not isinstance(template, str):
+        raise ValueError("path_template must be a non-empty string")
+    if template.startswith("/") or template.endswith("/"):
+        raise ValueError(
+            f"path_template must not start or end with '/', got {template!r}"
+        )
+
+    # Parse placeholders without substituting any value. string.Formatter
+    # raises ValueError on unclosed braces, e.g. "{workspace_id".
+    formatter = string.Formatter()
+    field_names: list[str] = []
+    try:
+        for _literal, field_name, _spec, _conversion in formatter.parse(template):
+            if field_name is not None:
+                field_names.append(field_name)
+    except ValueError as exc:
+        raise ValueError(
+            f"path_template has malformed placeholder syntax: {template!r} ({exc})"
+        ) from None
+
+    if field_names != ["workspace_id"]:
+        raise ValueError(
+            f"path_template must contain exactly one '{{workspace_id}}' "
+            f"placeholder and no others, got placeholders {field_names!r} "
+            f"in {template!r}"
+        )
+
+    # Substitute a recognisable sentinel and inspect each path segment.
+    sample = template.format(workspace_id=_TEMPLATE_PLACEHOLDER_SENTINEL)
+    for seg in sample.split("/"):
+        if not seg:
+            raise ValueError(
+                f"path_template has empty segment (consecutive '/'): {template!r}"
+            )
+        if seg in (".", ".."):
+            raise ValueError(
+                f"path_template segment {seg!r} is '.' or '..' "
+                f"(path traversal): {template!r}"
+            )
+        if seg == _TEMPLATE_PLACEHOLDER_SENTINEL:
+            # workspace_id slot — runtime value validated by C1 in get_secrets.
+            continue
+        unsafe = set(seg) & _UNSAFE_TEMPLATE_CHARS
+        if unsafe:
+            raise ValueError(
+                f"path_template segment {seg!r} contains unsafe URL chars "
+                f"{sorted(unsafe)!r}: {template!r}"
+            )
+
 
 class OpenBaoSecretProvider:
     """Read-only KV v2 adapter for OpenBao / Vault.
@@ -41,10 +146,13 @@ class OpenBaoSecretProvider:
     :param endpoint: Base URL, e.g. ``"https://openbao.internal:8200"``.
         Must start with ``http://`` or ``https://``. Trailing slash stripped.
     :param token: OpenBao token. Stored internally, never logged or repr'd.
-    :param mount: KV v2 mount point (default ``"secret"``). Single path segment,
-        no slashes.
+    :param mount: KV v2 mount point (default ``"secret"``). Single path
+        segment matching ``[A-Za-z0-9_.-]+``; not ``"."`` or ``".."``.
     :param path_template: Path template under mount. Must contain exactly one
-        ``{workspace_id}`` placeholder. Must not contain ``..``.
+        ``{workspace_id}`` placeholder and no others. Must not start or end
+        with ``"/"``. No empty / ``"."`` / ``".."`` segments. No unsafe URL
+        chars (``? # \\ : @ %``) in literal segments. See
+        :func:`_validate_path_template` for full rules.
     :param timeout_connect: TCP connect timeout in seconds (default 5.0, positive).
     :param timeout_read: Read timeout in seconds (default 30.0, positive).
     :raises ValueError: On any invalid constructor argument.
@@ -83,25 +191,11 @@ class OpenBaoSecretProvider:
         # ── Validate token ─────────────────────────────────────────────────
         if not token or not isinstance(token, str):
             raise ValueError("token must be a non-empty string")
-        # ── Validate mount ─────────────────────────────────────────────────
-        if not mount or not isinstance(mount, str):
-            raise ValueError("mount must be a non-empty string")
-        if "/" in mount:
-            raise ValueError(
-                f"mount must be a single path segment (no slashes), got {mount!r}"
-            )
-        # ── Validate path_template ─────────────────────────────────────────
-        if not path_template or not isinstance(path_template, str):
-            raise ValueError("path_template must be a non-empty string")
-        if "{workspace_id}" not in path_template:
-            raise ValueError(
-                "path_template must contain exactly one '{workspace_id}' placeholder, "
-                f"got {path_template!r}"
-            )
-        if ".." in path_template:
-            raise ValueError(
-                f"path_template must not contain '..' segments, got {path_template!r}"
-            )
+        # ── Validate mount + path_template (module-level helpers) ──────────
+        # Both raise ValueError on any unsafe input before we store anything,
+        # so a failed validation never leaves a half-constructed adapter.
+        _validate_mount(mount)
+        _validate_path_template(path_template)
         # ── Validate timeouts ──────────────────────────────────────────────
         if not isinstance(timeout_connect, (int, float)) or timeout_connect <= 0:
             raise ValueError(

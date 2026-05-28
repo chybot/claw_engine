@@ -179,6 +179,159 @@ def test_construction_endpoint_credential_leak_message_excludes_secret() -> None
     assert embedded_pw not in repr(exc_info.value)
 
 
+# ── Mount validation (defense in depth: same class as C1 workspace_id) ───────
+
+
+@pytest.mark.parametrize(
+    "bad_mount",
+    [
+        ".",
+        "..",
+        "secret/extra",
+        "secret/",
+        "/secret",
+        "",
+        "secret\\evil",
+        "secret#hash",
+        "secret?q=1",
+        "secret with space",
+        "secret@host",
+        "secret:port",
+        "secret%2F",
+    ],
+)
+def test_construction_rejects_unsafe_mount(bad_mount: str) -> None:
+    """mount must be a single safe URL path segment; '.' / '..' / slashes /
+    unsafe chars all rejected at construction.
+    """
+    with pytest.raises(ValueError, match="mount"):
+        OpenBaoSecretProvider(**{**VALID_KWARGS, "mount": bad_mount})
+
+
+@pytest.mark.parametrize(
+    "good_mount",
+    ["secret", "kv", "my-mount", "mount_1", "Mount.v2", "ABC", "a", "kv-v2"],
+)
+def test_construction_accepts_valid_mount(good_mount: str) -> None:
+    """Well-formed mount values pass validation (no HTTP attempted)."""
+    provider = OpenBaoSecretProvider(**{**VALID_KWARGS, "mount": good_mount})
+    assert provider is not None
+
+
+# ── path_template validation ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "bad_template",
+    [
+        "{workspace_id}/{workspace_id}",         # duplicate placeholder
+        "/claw/{workspace_id}",                  # leading slash
+        "claw/{workspace_id}/",                  # trailing slash
+        "claw/{bad}/{workspace_id}",             # unknown placeholder
+        "claw/{workspace_id}/{other}",           # unknown placeholder after valid
+        "claw//{workspace_id}",                  # empty segment
+        "claw/../{workspace_id}",                # .. segment
+        "claw/./{workspace_id}",                 # . segment
+        "claw/{workspace_id}/path?q=1",          # unsafe char in literal
+        "claw/{workspace_id}#frag",              # unsafe char in literal
+        "claw/{workspace_id}\\back",             # backslash
+        "",                                       # empty
+        "{}",                                     # empty placeholder name
+        "{0}",                                    # positional placeholder
+        "{workspace_id",                          # malformed (unclosed brace)
+        "no-placeholder-at-all",                 # missing workspace_id
+        "/",                                      # only slash
+        "claw/{workspace_id}/with:colon",        # colon in literal
+        "claw/{workspace_id}/percent%2F",        # percent in literal
+        "claw/{workspace_id}@host",              # @ in literal
+    ],
+)
+def test_construction_rejects_unsafe_path_template(bad_template: str) -> None:
+    """path_template static-structure validation rejects unsafe shapes."""
+    with pytest.raises(ValueError, match="path_template"):
+        OpenBaoSecretProvider(**{**VALID_KWARGS, "path_template": bad_template})
+
+
+@pytest.mark.parametrize(
+    "good_template",
+    [
+        "{workspace_id}",
+        "claw/{workspace_id}",
+        "claw/workspaces/{workspace_id}",
+        "a/b/c/{workspace_id}",
+        "{workspace_id}/secrets",
+        "claw/{workspace_id}/v1",
+    ],
+)
+def test_construction_accepts_valid_path_template(good_template: str) -> None:
+    """Well-formed path_templates pass validation."""
+    provider = OpenBaoSecretProvider(
+        **{**VALID_KWARGS, "path_template": good_template}
+    )
+    assert provider is not None
+
+
+def test_construction_unsafe_inputs_never_hit_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All mount/path_template rejection paths fail before any HTTP attempt."""
+    call_count = {"get": 0, "post": 0}
+
+    def bomb_get(*args, **kwargs):
+        call_count["get"] += 1
+        raise AssertionError("requests.get must not be called for invalid constructor inputs")
+
+    def bomb_post(*args, **kwargs):
+        call_count["post"] += 1
+        raise AssertionError("requests.post must not be called for invalid constructor inputs")
+
+    monkeypatch.setattr(requests, "get", bomb_get)
+    monkeypatch.setattr(requests, "post", bomb_post)
+
+    bad_mount_cases = [".", "..", "secret/extra", "/secret", "secret#hash"]
+    bad_template_cases = [
+        "{workspace_id}/{workspace_id}",
+        "/claw/{workspace_id}",
+        "claw/{bad}/{workspace_id}",
+        "claw/../{workspace_id}",
+        "claw//{workspace_id}",
+        "{workspace_id",
+    ]
+
+    for bad_mount in bad_mount_cases:
+        with pytest.raises(ValueError):
+            OpenBaoSecretProvider(**{**VALID_KWARGS, "mount": bad_mount})
+
+    for bad_template in bad_template_cases:
+        with pytest.raises(ValueError):
+            OpenBaoSecretProvider(
+                **{**VALID_KWARGS, "path_template": bad_template}
+            )
+
+    assert call_count == {"get": 0, "post": 0}, (
+        f"Construction made HTTP calls on rejection: {call_count}"
+    )
+
+
+def test_construction_user_reported_cases_all_rejected() -> None:
+    """Explicit pin: the 5 user-reported gap cases all raise ValueError."""
+    user_reported = [
+        ("mount", ".."),
+        ("mount", "."),
+        ("path_template", "{workspace_id}/{workspace_id}"),
+        ("path_template", "/claw/{workspace_id}"),
+        ("path_template", "claw/{bad}/{workspace_id}"),
+    ]
+    for param_name, bad_value in user_reported:
+        with pytest.raises(ValueError) as exc_info:
+            OpenBaoSecretProvider(**{**VALID_KWARGS, param_name: bad_value})
+        # Error message should mention which parameter failed
+        assert param_name in str(exc_info.value).lower(), (
+            f"Error message for {param_name}={bad_value!r} should mention "
+            f"{param_name!r}: {exc_info.value!s}"
+        )
+
+
 # ── HC-B: 404 → {} ───────────────────────────────────────────────────────────
 
 
