@@ -159,7 +159,7 @@ def test_remove_policy_does_not_modify_policy_file(tmp_path: pathlib.Path) -> No
         model_path=MODEL_PATH,
         policy_path=policy,
     )
-    adapter.remove_policy("alice", "ws-ads", "skill1", "use")
+    adapter.remove_policy("alice", "ws-ads", "skill1", "use", "deny")
 
     assert policy.stat().st_mtime == mtime_before
     assert policy.read_bytes() == content_before
@@ -294,12 +294,12 @@ def test_add_remove_policy_immediate_effect(tmp_path: pathlib.Path) -> None:
     assert result2 is False
 
     # Remove deny rule → takes effect immediately
-    removed = adapter.remove_policy("alice", "ws-ads", "skill1", "use")
+    removed = adapter.remove_policy("alice", "ws-ads", "skill1", "use", "deny")
     assert removed is True
     assert adapter.can_use_skill(_alice(), "ws-ads", "skill1") is True
 
     # Remove again → returns False (not present)
-    removed2 = adapter.remove_policy("alice", "ws-ads", "skill1", "use")
+    removed2 = adapter.remove_policy("alice", "ws-ads", "skill1", "use", "deny")
     assert removed2 is False
 
 
@@ -425,8 +425,8 @@ def test_delegation_correctness(tmp_path: pathlib.Path) -> None:
 # ── §6 Invariant #12: Bad policy/model file raises adapter-local error ──────
 
 def test_nonexistent_policy_file_raises() -> None:
-    """Invariant 12: non-existent policy_path → CasbinIdentityProviderError or FileNotFoundError."""
-    with pytest.raises((CasbinIdentityProviderError, FileNotFoundError)):
+    """Invariant 12: non-existent policy_path → CasbinIdentityProviderError with 'not found'."""
+    with pytest.raises(CasbinIdentityProviderError, match="not found"):
         CasbinIdentityProvider(
             base=_base_with_alice_bob(),
             model_path=MODEL_PATH,
@@ -435,8 +435,8 @@ def test_nonexistent_policy_file_raises() -> None:
 
 
 def test_nonexistent_model_file_raises() -> None:
-    """Invariant 12: non-existent model_path → CasbinIdentityProviderError or FileNotFoundError."""
-    with pytest.raises((CasbinIdentityProviderError, FileNotFoundError, Exception)):
+    """Invariant 12: non-existent model_path → CasbinIdentityProviderError with 'not found'."""
+    with pytest.raises(CasbinIdentityProviderError, match="not found"):
         CasbinIdentityProvider(
             base=_base_with_alice_bob(),
             model_path=pathlib.Path("/nonexistent/model.conf"),
@@ -547,3 +547,112 @@ def test_identity_contract_cross_impl(
     assert provider.can_access_workspace(user, "ws-ads") is True
     # can_access_workspace: unauthorized workspace → False
     assert provider.can_access_workspace(user, "ws-nonexistent") is False
+
+
+# ── Code-review feedback: I1 — reload_policy wraps raw Casbin exceptions ────
+
+def test_reload_policy_wraps_failures(tmp_path: pathlib.Path) -> None:
+    """I1: reload_policy() raises CasbinIdentityProviderError, not raw Casbin/OS exceptions.
+
+    Encapsulation contract: callers catching ``CasbinIdentityProviderError``
+    do not need to import from the casbin package.
+    """
+    policy = tmp_path / "policy.csv"
+    policy.write_text("# empty\n")
+    adapter = CasbinIdentityProvider(
+        base=_base_with_alice_bob(),
+        model_path=MODEL_PATH,
+        policy_path=policy,
+    )
+    # Delete the policy file from under the adapter
+    policy.unlink()
+
+    with pytest.raises(CasbinIdentityProviderError, match="not found"):
+        adapter.reload_policy()
+
+
+def test_reload_policy_wraps_parse_failures(tmp_path: pathlib.Path) -> None:
+    """I1 follow-on: reload_policy() wraps Casbin parse errors too.
+
+    Truncated/corrupted policy.csv must surface as CasbinIdentityProviderError,
+    not as a raw casbin-internal exception.
+    """
+    policy = tmp_path / "policy.csv"
+    policy.write_text("# empty\n")
+    adapter = CasbinIdentityProvider(
+        base=_base_with_alice_bob(),
+        model_path=MODEL_PATH,
+        policy_path=policy,
+    )
+    # Inject garbage that Casbin's CSV parser may still load (most malformed
+    # rows are silently skipped by Casbin). To force a real parse failure we
+    # simulate by replacing _enforcer.load_policy to raise.
+    def _boom() -> None:
+        raise RuntimeError("simulated casbin parse failure")
+
+    adapter._enforcer.load_policy = _boom  # type: ignore[method-assign]
+
+    with pytest.raises(CasbinIdentityProviderError, match="Failed to reload"):
+        adapter.reload_policy()
+
+
+# ── Code-review feedback: I2 — add_policy validates eft ─────────────────────
+
+@pytest.mark.parametrize("bad_eft", ["DENY", "Deny", "Allow", "ALLOW", "", "permit", "deny "])
+def test_add_policy_rejects_invalid_effect(
+    tmp_path: pathlib.Path, bad_eft: str
+) -> None:
+    """I2: add_policy raises ValueError on any non-canonical eft string.
+
+    Prevents silent typo policies that don't actually deny anything.
+    """
+    adapter = _adapter_empty_policy(tmp_path)
+    with pytest.raises(ValueError, match="eft must be one of"):
+        adapter.add_policy("alice", "ws", "skill", "use", bad_eft)
+
+
+def test_add_policy_accepts_canonical_effects(tmp_path: pathlib.Path) -> None:
+    """I2: both 'allow' and 'deny' are accepted (exact case)."""
+    adapter = _adapter_empty_policy(tmp_path)
+    assert adapter.add_policy("alice", "ws", "skill1", "use", "deny") is True
+    assert adapter.add_policy("alice", "ws", "skill2", "use", "allow") is True
+
+
+# ── Code-review feedback: I3 — remove_policy explicit eft ──────────────────
+
+@pytest.mark.parametrize("bad_eft", ["DENY", "Deny", "Allow", "ALLOW", "", "permit"])
+def test_remove_policy_rejects_invalid_effect(
+    tmp_path: pathlib.Path, bad_eft: str
+) -> None:
+    """I3: remove_policy raises ValueError on non-canonical eft strings."""
+    adapter = _adapter_empty_policy(tmp_path)
+    with pytest.raises(ValueError, match="eft must be one of"):
+        adapter.remove_policy("alice", "ws", "skill", "use", bad_eft)
+
+
+def test_remove_policy_distinguishes_effects(tmp_path: pathlib.Path) -> None:
+    """I3: remove_policy(eft='deny') removes ONLY the deny rule, leaving allow intact.
+
+    Prevents the prior ambiguous deny-then-allow fallback behavior where the
+    caller could not tell which effect's rule had been removed.
+    """
+    adapter = _adapter_empty_policy(tmp_path)
+    # Add both a deny and an allow rule for the same (sub, ws, obj, act)
+    assert adapter.add_policy("alice", "ws", "foo", "use", "deny") is True
+    assert adapter.add_policy("alice", "ws", "foo", "use", "allow") is True
+
+    # With deny present, can_use_skill is False (deny dominates default-allow)
+    assert adapter.can_use_skill(_alice(), "ws", "foo") is False
+
+    # Remove ONLY the deny rule
+    assert adapter.remove_policy("alice", "ws", "foo", "use", "deny") is True
+
+    # Allow rule remains; default-allow lets the request through (no deny matches)
+    assert adapter.can_use_skill(_alice(), "ws", "foo") is True
+
+    # Removing the same deny again returns False (already gone)
+    assert adapter.remove_policy("alice", "ws", "foo", "use", "deny") is False
+
+    # The allow rule is still in the enforcer's policy table
+    policies = adapter._enforcer.get_policy()
+    assert ["alice", "ws", "foo", "use", "allow"] in policies

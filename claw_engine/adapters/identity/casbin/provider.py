@@ -65,6 +65,12 @@ import casbin  # intentionally only imported inside this adapter sub-package
 from claw_engine.engine.identity.contracts import IdentityProvider, User
 from claw_engine.adapters.identity.casbin.errors import CasbinIdentityProviderError
 
+# Allowed effect values for add_policy / remove_policy. Casbin's matcher
+# ``e = !some(where (p.eft == deny))`` is case-sensitive — any other casing
+# (e.g. ``"Deny"``) becomes silently inert policy noise. Validating eagerly
+# turns that class of typo into an obvious caller-side error.
+_ALLOWED_EFFECTS: tuple[str, ...] = ("allow", "deny")
+
 
 class CasbinIdentityProvider:
     """Casbin-backed skill/workflow authorization adapter.
@@ -180,8 +186,22 @@ class CasbinIdentityProvider:
 
         Call this after editing policy.csv on disk to pick up the changes.
         There is no file watcher — changes do NOT take effect automatically.
+
+        :raises CasbinIdentityProviderError: If ``policy_path`` no longer exists
+            on disk, or if Casbin fails to parse it. The adapter-local error
+            type is preserved so callers don't have to import from casbin
+            to handle reload failures.
         """
-        self._enforcer.load_policy()
+        if not self._policy_path.exists():
+            raise CasbinIdentityProviderError(
+                f"Casbin policy file not found: {self._policy_path}"
+            )
+        try:
+            self._enforcer.load_policy()
+        except Exception as exc:
+            raise CasbinIdentityProviderError(
+                f"Failed to reload Casbin policy from {self._policy_path}: {exc}"
+            ) from exc
 
     def add_policy(
         self,
@@ -200,9 +220,15 @@ class CasbinIdentityProvider:
         :param ws: Workspace ID (or ``"*"``).
         :param obj: Skill or workflow name (or ``"*"``).
         :param act: Action — ``"use"``, ``"run"``, or ``"*"``.
-        :param eft: Effect — ``"deny"`` (default) or ``"allow"``.
+        :param eft: Effect — ``"deny"`` (default) or ``"allow"``. Case-sensitive;
+            anything else raises ``ValueError`` (avoids silent typo policies).
         :returns: True if the rule was added; False if it was already present.
+        :raises ValueError: If ``eft`` is not exactly ``"allow"`` or ``"deny"``.
         """
+        if eft not in _ALLOWED_EFFECTS:
+            raise ValueError(
+                f"eft must be one of {_ALLOWED_EFFECTS}, got {eft!r}"
+            )
         return bool(self._enforcer.add_policy(sub, ws, obj, act, eft))
 
     def remove_policy(
@@ -211,19 +237,30 @@ class CasbinIdentityProvider:
         ws: str,
         obj: str,
         act: str,
+        eft: str = "deny",
     ) -> bool:
-        """Remove the first matching rule from the in-memory policy.
+        """Remove a single Casbin rule matching ``(sub, ws, obj, act, eft)`` from
+        the in-memory policy.
+
+        Mirrors :meth:`add_policy`'s shape — the ``eft`` field is required to
+        disambiguate when both an allow and a deny rule exist for the same
+        ``(sub, ws, obj, act)`` tuple. Defaults to ``"deny"`` since deny rules
+        are the dominant case under this adapter's default-allow model.
 
         This is a pure in-memory operation. The ``policy_path`` file on disk
-        is NOT modified.
+        is NOT modified. Use :meth:`reload_policy` to discard in-memory
+        mutations and revert to the on-disk policy.
 
-        The ``eft`` (effect) field is not required for removal; the first rule
-        matching (sub, ws, obj, act) is removed regardless of its effect.
-
-        :returns: True if a rule was removed; False if no matching rule found.
+        :param sub: Subject (user_id or ``"*"``).
+        :param ws: Workspace ID (or ``"*"``).
+        :param obj: Skill or workflow name (or ``"*"``).
+        :param act: Action — ``"use"``, ``"run"``, or ``"*"``.
+        :param eft: Effect — ``"deny"`` (default) or ``"allow"``.
+        :returns: True if a rule was removed; False if no matching rule existed.
+        :raises ValueError: If ``eft`` is not exactly ``"allow"`` or ``"deny"``.
         """
-        # Try to remove deny first; fall back to allow if not found.
-        removed = self._enforcer.remove_policy(sub, ws, obj, act, "deny")
-        if not removed:
-            removed = self._enforcer.remove_policy(sub, ws, obj, act, "allow")
-        return bool(removed)
+        if eft not in _ALLOWED_EFFECTS:
+            raise ValueError(
+                f"eft must be one of {_ALLOWED_EFFECTS}, got {eft!r}"
+            )
+        return bool(self._enforcer.remove_policy(sub, ws, obj, act, eft))
