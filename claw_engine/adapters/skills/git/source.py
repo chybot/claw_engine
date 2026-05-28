@@ -11,6 +11,7 @@ System requirement: ``git`` must be on PATH.  No Python git library is used.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -254,12 +255,21 @@ class GitSkillSource:
             )
         else:
             # Full tree — disable sparse-checkout if it was previously enabled.
+            # Only swallow the narrow case where the git binary does not know
+            # the `sparse-checkout disable` subcommand (pre-2.27).  Re-raise
+            # everything else (e.g. corrupted index.lock from a killed prior
+            # refresh) so the caller sees the real failure, not a silently
+            # ignored sparse working tree.
             try:
                 _git("sparse-checkout", "disable", cwd=self._cache_dir)
-            except GitSkillSourceError:
-                # older git versions may not support sparse-checkout disable;
-                # ignore if it fails (full checkout proceeds normally).
-                pass
+            except GitSkillSourceError as exc:
+                stderr_lower = exc.stderr.lower()
+                if "unknown" in stderr_lower or "is not a git command" in stderr_lower:
+                    # Older git (< 2.27): subcommand not recognised — full
+                    # checkout still proceeds normally below.
+                    pass
+                else:
+                    raise
 
         # --- fetch then checkout via FETCH_HEAD (works for branches, tags, SHAs) ---
         # We use `--detach FETCH_HEAD` rather than `checkout <ref>` because after a
@@ -288,16 +298,31 @@ class GitSkillSource:
             if any_nested:
                 flat_dir = self._cache_dir / ".claw_skills_flat"
                 flat_dir.mkdir(exist_ok=True)
+                # NOTE: this overlay is rebuilt on every refresh — even a same-ref
+                # refresh repays the symlink work.  Not a no-op; an optimization is
+                # tracked as a follow-up (do not assume idempotency-of-disk-state).
                 for p in self._allowed_skill_paths:
                     basename = os.path.basename(p)
                     link_path = flat_dir / basename
-                    # Remove stale symlink / dir from previous refresh.
+                    # Clear any stale entry from a previous (possibly crashed)
+                    # refresh.  Handle three cases cleanly:
+                    #   - symlink              → unlink
+                    #   - regular file         → unlink (e.g. user touched cache,
+                    #                            or a half-written previous run)
+                    #   - directory            → rmtree
+                    # Wrap in try/except so unexpected OS errors surface as a
+                    # clean GitSkillSourceError rather than a raw OSError.
                     if link_path.is_symlink() or link_path.exists():
-                        if link_path.is_symlink():
-                            link_path.unlink()
-                        else:
-                            import shutil as _shutil
-                            _shutil.rmtree(link_path)
+                        try:
+                            if link_path.is_symlink() or link_path.is_file():
+                                link_path.unlink()
+                            else:
+                                shutil.rmtree(link_path)
+                        except OSError as exc:
+                            raise GitSkillSourceError(
+                                f"Failed to clear stale overlay entry {link_path}: {exc}",
+                                stage="refresh",
+                            ) from exc
                     target = self._cache_dir / p
                     if target.exists():
                         link_path.symlink_to(target)
@@ -305,7 +330,9 @@ class GitSkillSource:
             else:
                 self._local = LocalDirSkillSource(str(self._cache_dir))
         else:
-            # One-level scan of cache_dir (exclude .git and dotfiles).
+            # One-level scan of cache_dir (exclude .git, .claw_skills_flat from
+            # a prior nested refresh, and any other dotfiles via the leading-dot
+            # filter).
             skill_names = tuple(
                 entry.name
                 for entry in sorted(self._cache_dir.iterdir())

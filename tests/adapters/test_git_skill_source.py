@@ -261,6 +261,109 @@ def test_nested_layout(tmp_path: Path) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Regression: overlay regular-file collision must not crash refresh (I1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_refresh_recovers_when_overlay_has_regular_file_collision(
+    tmp_path: Path,
+) -> None:
+    """If .claw_skills_flat/<basename> is a regular file (e.g. half-written
+    previous run), refresh() must replace it cleanly and not raise raw
+    NotADirectoryError.
+    """
+    url = make_bare_repo_with_skills(
+        tmp_path / "repo",
+        skills={"dag_tracer": "# dag"},
+        layout="nested",
+    )
+    cache = tmp_path / "cache"
+    gs = GitSkillSource(
+        url,
+        "main",
+        cache,
+        allowed_skill_paths=["skills/dag_tracer"],
+    )
+    # First refresh creates the overlay with a proper symlink.
+    gs.refresh()
+    assert gs.has_skill("dag_tracer") is True
+
+    # Sabotage the overlay: replace the symlink with a regular file.
+    flat_entry = cache / ".claw_skills_flat" / "dag_tracer"
+    if flat_entry.is_symlink():
+        flat_entry.unlink()
+    flat_entry.write_text("regular file collision", encoding="utf-8")
+    assert flat_entry.is_file()
+    assert not flat_entry.is_symlink()
+
+    # Second refresh must clear the regular file and recreate the symlink.
+    # Must NOT raise NotADirectoryError or any other raw OSError.
+    gs.refresh()  # if I1 not fixed, this raises NotADirectoryError
+    assert gs.has_skill("dag_tracer") is True
+    # Confirm the entry is once again a symlink.
+    assert (cache / ".claw_skills_flat" / "dag_tracer").is_symlink()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression: sparse-checkout disable swallow is narrow (I6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_sparse_checkout_disable_failure_not_silently_swallowed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If `sparse-checkout disable` fails for a non-'unknown subcommand' reason
+    (e.g. corrupted index.lock), refresh() must surface the error rather than
+    silently swallow it and proceed with a still-sparse working tree.
+    """
+    # First do a successful refresh with allowed_skill_paths so the cache is
+    # in a state where the next refresh (with allowed_skill_paths=None) will
+    # try to run `sparse-checkout disable`.
+    url = make_bare_repo_with_skills(
+        tmp_path / "repo",
+        skills={"foo": "# foo"},
+    )
+    cache = tmp_path / "cache"
+
+    gs1 = GitSkillSource(url, "main", cache, allowed_skill_paths=["foo"])
+    gs1.refresh()
+
+    # Second source: same cache, no allowed_skill_paths → triggers disable.
+    gs2 = GitSkillSource(url, "main", cache)
+
+    # Monkey-patch subprocess.run to inject a failure ONLY for the
+    # `sparse-checkout disable` call, with a stderr that is NOT the
+    # 'unknown subcommand' pattern.  All other git calls pass through.
+    real_run = subprocess.run
+
+    def _fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        argv = args[0] if args else kwargs.get("args", [])
+        # Detect the disable call.
+        if (
+            isinstance(argv, list)
+            and len(argv) >= 3
+            and argv[0] == "git"
+            and argv[1] == "sparse-checkout"
+            and argv[2] == "disable"
+        ):
+            # Simulate a corrupted-state error (e.g. index.lock contention).
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=128,
+                stdout="",
+                stderr="fatal: Unable to create '.git/index.lock': File exists.",
+            )
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    with pytest.raises(GitSkillSourceError) as exc_info:
+        gs2.refresh()
+    assert exc_info.value.stage == "sparse-checkout"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Invariant 10 — Bad repo URL → stage='clone'
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -395,24 +498,56 @@ def test_path_validation_rejects_before_subprocess(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_cache_dir_realpath_containment(tmp_path: Path) -> None:
-    """All files in cache_dir resolve under cache_dir.realpath() — no symlinks escape."""
-    url = make_bare_repo_with_skills(
-        tmp_path / "repo",
-        skills={"foo": "# foo"},
-    )
+@pytest.mark.parametrize(
+    "layout,allowed_skill_paths",
+    [
+        ("flat", None),                       # no overlay
+        ("nested", ["skills/dag_tracer"]),    # symlink overlay branch
+    ],
+    ids=["flat_no_overlay", "nested_with_overlay"],
+)
+def test_cache_dir_realpath_containment(
+    tmp_path: Path,
+    layout: str,
+    allowed_skill_paths,
+) -> None:
+    """All files (and symlink targets) in cache_dir resolve under cache_dir.
+
+    Covers both the flat path (no overlay) and the nested path that builds a
+    .claw_skills_flat symlink overlay — the actual escape vector.  Walks every
+    entry (not just files) so symlinks themselves are inspected.
+    """
+    if layout == "flat":
+        url = make_bare_repo_with_skills(
+            tmp_path / "repo",
+            skills={"foo": "# foo"},
+        )
+    else:
+        url = make_bare_repo_with_skills(
+            tmp_path / "repo",
+            skills={"dag_tracer": "# dag"},
+            layout="nested",
+        )
+
     cache = tmp_path / "cache"
-    gs = GitSkillSource(url, "main", cache)
+    gs = GitSkillSource(
+        url,
+        "main",
+        cache,
+        allowed_skill_paths=allowed_skill_paths,
+    )
     gs.refresh()
 
     cache_real = os.path.realpath(cache)
-    for dirpath, _dirs, files in os.walk(cache_real):
-        for fname in files:
-            full = os.path.join(dirpath, fname)
+    # Walk EVERY entry (dirs, files, symlinks).  followlinks=False so we visit
+    # the symlinks themselves rather than chasing their targets.
+    for dirpath, dirs, files in os.walk(cache_real, followlinks=False):
+        for name in list(dirs) + list(files):
+            full = os.path.join(dirpath, name)
             real = os.path.realpath(full)
             common = os.path.commonpath([cache_real, real])
             assert common == cache_real, (
-                f"File {full!r} resolves to {real!r} which is outside cache_dir"
+                f"Entry {full!r} resolves to {real!r} which is outside cache_dir"
             )
 
 
