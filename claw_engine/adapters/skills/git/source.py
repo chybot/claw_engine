@@ -1,10 +1,15 @@
 """GitSkillSource — materialise a remote git repo into a local cache dir.
 
-Lifecycle (strict 3-phase separation):
-  1. Construction  — argument validation only; no network, no disk write.
-  2. refresh()     — git subprocess, write to cache_dir.
-  3. Read          — has_skill / has_dir / skill_dir delegate to LocalDirSkillSource;
-                     NEVER invoke subprocess.
+Lifecycle (strict 3-phase separation — see sub-plan §1):
+
+  1. Construction  — argument validation only; **NO network, NO disk write,
+                     NO subprocess**.  No exceptions.  The constructor never
+                     touches ``cache_dir`` (not even ``mkdir``) and never
+                     invokes ``git``.
+  2. refresh()     — git subprocess, write to ``cache_dir``.  Caller must
+                     invoke this explicitly before reading skills.
+  3. Read          — has_skill / has_dir / skill_dir delegate to
+                     LocalDirSkillSource; NEVER invoke subprocess.
 
 System requirement: ``git`` must be on PATH.  No Python git library is used.
 """
@@ -155,8 +160,11 @@ class RefreshResult:
 class GitSkillSource:
     """SkillSource backed by a remote git repository.
 
-    Construction is hermetic (no IO).  Call refresh() to materialise the
-    repository into cache_dir, then use has_skill / has_dir / skill_dir.
+    Construction never refreshes; caller MUST call ``refresh()`` explicitly
+    before reading skills.  The constructor performs only argument validation
+    (and pure-string path-traversal checks on ``allowed_skill_paths``).  It
+    does not touch the filesystem, does not invoke ``git``, and does not
+    create ``cache_dir`` — all IO is deferred to ``refresh()``.
 
     Args:
         repo_url: any URL that ``git clone`` accepts (https://, git@, file://).
@@ -165,7 +173,6 @@ class GitSkillSource:
         allowed_skill_paths: if given, sparse-checkout exactly these paths
             (relative to the repo root).  When None (default), clones the full
             tree and derives skill names from a one-level scan of cache_dir.
-        eager: when True, calls refresh() during __init__.
 
     Thread safety: refresh() is NOT thread-safe.  Concurrent callers sharing
     the same cache_dir must serialise externally.
@@ -178,8 +185,12 @@ class GitSkillSource:
         cache_dir: str | Path,
         *,
         allowed_skill_paths: Sequence[str] | None = None,
-        eager: bool = False,
     ) -> None:
+        """Validate arguments and store fields.  NO IO, NO subprocess.
+
+        All git operations and disk writes (including ``cache_dir`` creation)
+        are deferred to :meth:`refresh`.  See sub-plan §1 for the contract.
+        """
         if not repo_url:
             raise ValueError("repo_url must be a non-empty string")
         if not ref:
@@ -193,9 +204,6 @@ class GitSkillSource:
         )
         # Set during refresh(); None means "not yet refreshed".
         self._local: LocalDirSkillSource | None = None
-
-        if eager:
-            self.refresh()
 
     # ── Refresh ──────────────────────────────────────────────────────────────
 

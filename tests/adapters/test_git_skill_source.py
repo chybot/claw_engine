@@ -62,34 +62,80 @@ def _identity(denied: tuple[str, ...] = ()) -> tuple[InMemoryIdentityProvider, U
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Invariant 1 — No-IO construction
+# Invariant 1 — Construction is ALWAYS hermetic (⭐ acceptance-critical)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_no_io_construction(tmp_path: Path) -> None:
-    """GitSkillSource(eager=False) must not raise even for a nonexistent repo."""
-    # Should NOT touch the network or disk.
-    gs = GitSkillSource("file:///nonexistent.git", "main", tmp_path / "cache")
-    # Read methods return safe defaults — no error.
-    assert gs.has_skill("x") is False
-    assert gs.has_dir("x") is False
-    with pytest.raises(SkillNotFound):
-        gs.skill_dir("x")
+def test_construction_never_invokes_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Acceptance-critical invariant #1: construction is hermetic, always.
 
+    Per sub-plan §1 (corrected 2026-05-28): the construction phase forbids
+    network, disk write, and subprocess — no exceptions.  Monkey-patch
+    ``subprocess.run`` to bomb, then exercise every reasonable __init__
+    kwarg combination to prove no IO happens during construction.
+    """
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Invariant 2 — Eager construction
-# ─────────────────────────────────────────────────────────────────────────────
+    def _bomb(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError(
+            f"subprocess.run called during construction: args={args!r}"
+        )
 
+    monkeypatch.setattr(subprocess, "run", _bomb)
 
-def test_eager_construction(tmp_path: Path) -> None:
-    """eager=True triggers refresh during __init__; read methods work immediately."""
-    url = make_bare_repo_with_skills(
-        tmp_path / "repo",
-        skills={"foo": "# foo skill"},
+    # Bare construction, flat.
+    src1 = GitSkillSource(
+        "file:///nonexistent.git",
+        "main",
+        tmp_path / "c1",
     )
-    gs = GitSkillSource(url, "main", tmp_path / "cache", eager=True)
-    assert gs.has_skill("foo") is True
+
+    # Construction with explicit allowed_skill_paths — validation runs but
+    # is pure-string (no IO).
+    src2 = GitSkillSource(
+        "https://example.invalid/repo.git",
+        "v1.0",
+        tmp_path / "c2",
+        allowed_skill_paths=["skills/foo", "skills/bar"],
+    )
+
+    # Construction with allowed_skill_paths=None explicitly.
+    src3 = GitSkillSource(
+        "git@host:repo.git",
+        "abc123",
+        tmp_path / "c3",
+        allowed_skill_paths=None,
+    )
+
+    # Post-construction: read methods are hermetic and return safe defaults
+    # (refresh has not been called).
+    assert src1.has_skill("x") is False
+    assert src2.has_dir("y") is False
+    with pytest.raises(SkillNotFound):
+        src3.skill_dir("z")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Invariant 2 — Construction does NOT create cache_dir
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_construction_does_not_create_cache_dir(tmp_path: Path) -> None:
+    """Acceptance-critical invariant #2: __init__ must not create cache_dir.
+
+    All disk writes (including mkdir of cache_dir) are deferred to refresh().
+    """
+    cache_dir = tmp_path / "does-not-exist-yet"
+    assert not cache_dir.exists()
+
+    _ = GitSkillSource("file:///fake.git", "main", cache_dir)
+
+    # Construction must NOT have created the directory.
+    assert not cache_dir.exists(), (
+        "construction created cache_dir; should be deferred to refresh()"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
