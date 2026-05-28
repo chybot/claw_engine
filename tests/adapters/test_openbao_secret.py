@@ -136,6 +136,49 @@ def test_construction_rejects_negative_timeout_read() -> None:
         OpenBaoSecretProvider(**{**VALID_KWARGS, "timeout_read": -1.0})
 
 
+# ── I2: Endpoint must not carry credentials, query, or fragment ──────────────
+
+
+@pytest.mark.parametrize(
+    "bad_endpoint",
+    [
+        "https://user:pass@vault.internal:8200",
+        "https://user@vault.internal:8200",
+        "https://:pass@vault.internal:8200",
+    ],
+)
+def test_construction_rejects_endpoint_with_credentials(bad_endpoint: str) -> None:
+    """I2: endpoint with embedded user:pass → ValueError (prevents __repr__ leak)."""
+    with pytest.raises(ValueError, match="credentials"):
+        OpenBaoSecretProvider(**{**VALID_KWARGS, "endpoint": bad_endpoint})
+
+
+@pytest.mark.parametrize(
+    "bad_endpoint",
+    [
+        "https://vault.internal:8200?token=leak",
+        "https://vault.internal:8200#fragment",
+        "https://vault.internal:8200/?q=1",
+        "https://vault.internal:8200/#f",
+    ],
+)
+def test_construction_rejects_endpoint_with_query_or_fragment(bad_endpoint: str) -> None:
+    """I2: endpoint with query string or fragment → ValueError."""
+    with pytest.raises(ValueError, match="query or fragment"):
+        OpenBaoSecretProvider(**{**VALID_KWARGS, "endpoint": bad_endpoint})
+
+
+def test_construction_endpoint_credential_leak_message_excludes_secret() -> None:
+    """I2: the rejection error itself must not echo the embedded password."""
+    embedded_pw = "super-secret-pw-12345"
+    bad = f"https://user:{embedded_pw}@vault.internal:8200"
+    with pytest.raises(ValueError) as exc_info:
+        OpenBaoSecretProvider(**{**VALID_KWARGS, "endpoint": bad})
+    # Message intentionally omits the bad endpoint value so we don't echo creds
+    assert embedded_pw not in str(exc_info.value)
+    assert embedded_pw not in repr(exc_info.value)
+
+
 # ── HC-B: 404 → {} ───────────────────────────────────────────────────────────
 
 
@@ -559,8 +602,11 @@ def test_error_does_not_leak_token_on_timeout(monkeypatch: pytest.MonkeyPatch) -
     assert_no_token_leak(repr(exc))
     for arg in exc.args:
         assert_no_token_leak(str(arg))
-    # Verify the chain is suppressed (from None)
-    assert exc.__context__ is None or exc.__cause__ is None
+    # I5: pin the explicit `from None` semantics (sets __cause__ to None AND
+    # __suppress_context__ to True). Matches the connection_refused test
+    # below; the weaker OR-form would silently pass if `from None` regressed.
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
 
 
 def test_error_does_not_leak_token_on_connection_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -580,7 +626,9 @@ def test_error_does_not_leak_token_on_connection_refused(monkeypatch: pytest.Mon
     assert_no_token_leak(repr(exc))
     for arg in exc.args:
         assert_no_token_leak(str(arg))
+    # I5: also assert __suppress_context__ for stronger guarantee
     assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
 
 
 def test_error_does_not_leak_token_on_malformed_body(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -633,6 +681,137 @@ def test_safe_url_for_error_excludes_embedded_credentials() -> None:
     safe = provider._safe_url_for_error("ws-test")
     assert "user:pass" not in safe
     assert "pass" not in safe
+
+
+def test_safe_url_for_error_handles_ipv6_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """I1: IPv6 host literal is preserved with brackets in error messages."""
+    provider = OpenBaoSecretProvider(
+        endpoint="https://[::1]:8200",
+        token=SENTINEL_TOKEN,
+    )
+    safe = provider._safe_url_for_error("ws-test")
+    # IPv6 literal must be bracketed per RFC 3986 §3.2.2
+    assert "[::1]:8200" in safe
+    # Not stripped to bare "::1"
+    assert "://::1" not in safe
+
+    # Also verify via a real error path — trigger a connection error so the
+    # safe URL is materialised into an actual SecretProviderError message.
+    def bomb(*args, **kwargs):
+        raise requests.exceptions.ConnectionError("connection refused")
+
+    monkeypatch.setattr(requests, "get", bomb)
+    with pytest.raises(SecretProviderError) as exc_info:
+        provider.get_secrets("ws-test")
+    assert "[::1]:8200" in str(exc_info.value)
+
+
+# ── C1: workspace_id validation at adapter boundary ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    "bad_workspace_id",
+    [
+        "../escape",
+        "..",
+        ".",
+        "../../../etc/passwd",
+        "foo/../bar",
+        "a/b",
+        "a\\b",
+    ],
+)
+def test_get_secrets_rejects_path_traversal_workspace_id(
+    bad_workspace_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C1: path-traversal workspace_id → ValueError before any HTTP call."""
+    def bomb(*args, **kwargs):
+        raise AssertionError("requests.get must not be called for invalid workspace_id")
+
+    monkeypatch.setattr(requests, "get", bomb)
+    provider = OpenBaoSecretProvider(**VALID_KWARGS)
+    with pytest.raises(ValueError, match="workspace_id"):
+        provider.get_secrets(bad_workspace_id)
+
+
+@pytest.mark.parametrize(
+    "bad_workspace_id",
+    [
+        "foo#hash",
+        "foo?q=x",
+        "foo\nbar",
+        "foo bar",
+        "",
+        "foo@bar",
+        "foo%2Fbar",
+        "foo:bar",
+    ],
+)
+def test_get_secrets_rejects_url_unsafe_workspace_id(
+    bad_workspace_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C1: URL-unsafe workspace_id → ValueError before any HTTP call."""
+    def bomb(*args, **kwargs):
+        raise AssertionError("requests.get must not be called for invalid workspace_id")
+
+    monkeypatch.setattr(requests, "get", bomb)
+    provider = OpenBaoSecretProvider(**VALID_KWARGS)
+    with pytest.raises(ValueError, match="workspace_id"):
+        provider.get_secrets(bad_workspace_id)
+
+
+@pytest.mark.parametrize(
+    "good_workspace_id",
+    ["alpha", "ws-prod", "workspace_1", "a.b", "a-b-c", "ABC123", "x"],
+)
+def test_get_secrets_accepts_valid_workspace_id(good_workspace_id: str) -> None:
+    """C1: well-formed workspace_id passes validation (404 mock to avoid real HTTP)."""
+    with responses_lib.RequestsMock() as rsps:
+        rsps.add(
+            responses_lib.GET,
+            f"https://openbao.internal:8200/v1/secret/data/claw/workspaces/{good_workspace_id}",
+            status=404,
+            json={"errors": []},
+        )
+        provider = OpenBaoSecretProvider(**VALID_KWARGS)
+        result = provider.get_secrets(good_workspace_id)
+        assert result == {}
+
+
+def test_get_secrets_validation_matches_engine_regex() -> None:
+    """C1: adapter regex matches engine ``_validate_workspace_id`` exactly.
+
+    Cross-check by importing the engine validator and confirming both raise
+    on the same inputs. This guards against regex drift between adapter and
+    engine.
+    """
+    from claw_engine.engine.context.workspace import (
+        InvalidWorkspaceId,
+        _validate_workspace_id,
+    )
+
+    provider = OpenBaoSecretProvider(**VALID_KWARGS)
+    # Both should reject these
+    for bad in ["..", ".", "../escape", "a/b", "foo bar", "foo#x", ""]:
+        engine_raised = False
+        try:
+            _validate_workspace_id(bad)
+        except InvalidWorkspaceId:
+            engine_raised = True
+
+        adapter_raised = False
+        try:
+            # Use a faked-out client so we can't actually reach HTTP if validation slipped
+            provider.get_secrets(bad)
+        except ValueError:
+            adapter_raised = True
+        except Exception:
+            # Any other exception (e.g. AttributeError) means validation slipped
+            adapter_raised = False
+
+        assert engine_raised == adapter_raised, (
+            f"divergence on {bad!r}: engine={engine_raised}, adapter={adapter_raised}"
+        )
 
 
 # ── Cross-impl contract: InMemory + OpenBao both satisfy SecretProvider ──────

@@ -15,6 +15,7 @@ Token safety (HC-D):
 """
 from __future__ import annotations
 
+import re
 from typing import Mapping
 from urllib.parse import urlparse, urlunparse
 
@@ -25,6 +26,13 @@ from claw_engine.adapters.secrets.openbao.errors import SecretProviderError
 
 # Accept header sent on every request
 _ACCEPT_JSON = "application/json"
+
+# Mirrors engine/context/workspace.py::_WORKSPACE_ID_RE and the ('.', '..')
+# guard in _validate_workspace_id. Duplicated rather than imported because the
+# engine 0-diff rule forbids reaching into engine internals from adapters.
+# If this regex diverges across adapters, promote to a public helper in
+# engine.context (deferred to a follow-up PR).
+_WORKSPACE_ID_RE = re.compile(r"[A-Za-z0-9_.-]+")
 
 
 class OpenBaoSecretProvider:
@@ -58,6 +66,19 @@ class OpenBaoSecretProvider:
         if not (endpoint.startswith("http://") or endpoint.startswith("https://")):
             raise ValueError(
                 f"endpoint must start with 'http://' or 'https://', got {endpoint!r}"
+            )
+        # I2: Reject endpoints carrying credentials, query strings, or fragments.
+        # Embedded credentials in endpoint would leak via __repr__ even after
+        # HC-D.1 token redaction; query/fragment would break URL composition.
+        _parsed_endpoint = urlparse(endpoint)
+        if _parsed_endpoint.username or _parsed_endpoint.password:
+            raise ValueError(
+                "endpoint must not contain embedded credentials (user:pass@host); "
+                "pass the OpenBao token via the `token` parameter instead"
+            )
+        if _parsed_endpoint.query or _parsed_endpoint.fragment:
+            raise ValueError(
+                f"endpoint must not contain query or fragment, got {endpoint!r}"
             )
         # ── Validate token ─────────────────────────────────────────────────
         if not token or not isinstance(token, str):
@@ -110,9 +131,27 @@ class OpenBaoSecretProvider:
 
         :param workspace_id: Workspace identifier used to fill ``path_template``.
         :returns: ``Mapping[str, str]`` of secret keys to values.
+        :raises ValueError: If ``workspace_id`` fails the path-traversal /
+            URL-injection guard (mirrors engine ``_validate_workspace_id``).
         :raises SecretProviderError: On auth failure, backend error, timeout,
             network error, or malformed response body.
         """
+        # C1: Defense-in-depth — validate at the adapter boundary even though
+        # WorkspaceResolver also validates. Anyone holding a SecretProvider
+        # reference can call this directly, bypassing engine validation.
+        # Mirrors engine/context/workspace.py::_validate_workspace_id exactly:
+        # regex r"[A-Za-z0-9_.-]+" with fullmatch + explicit ('.', '..') ban.
+        if (
+            not workspace_id
+            or not isinstance(workspace_id, str)
+            or workspace_id in (".", "..")
+            or _WORKSPACE_ID_RE.fullmatch(workspace_id) is None
+        ):
+            raise ValueError(
+                f"Invalid workspace_id (path-traversal / URL-injection guard): "
+                f"{workspace_id!r}. Must match [A-Za-z0-9_.-]+ and not be '.' or '..'."
+            )
+
         path = self._path_template.format(workspace_id=workspace_id)
         url = f"{self._endpoint}/v1/{self._mount}/data/{path}"
         headers = {
@@ -175,15 +214,19 @@ class OpenBaoSecretProvider:
                 status=response.status_code,
             )
 
-        # HTTP 200 — parse KV v2 body
+        # HTTP 200 — parse KV v2 body.
+        # I4: narrow except to expected parse-failure types. KeyError/TypeError
+        # cover missing or non-dict `data.data`; ValueError covers
+        # requests.exceptions.JSONDecodeError (subclass of both ValueError and
+        # requests.RequestException — listed explicitly for clarity).
         try:
             body = response.json()
             secrets_raw = body["data"]["data"]
-        except Exception:
+        except (KeyError, TypeError, ValueError, requests.exceptions.JSONDecodeError):
             raise SecretProviderError(
                 message=(
-                    f"OpenBao response missing expected 'data.data' structure at "
-                    f"{self._safe_url_for_error(workspace_id)}"
+                    f"OpenBao response body malformed (missing data.data or "
+                    f"invalid JSON) at {self._safe_url_for_error(workspace_id)}"
                 ),
                 stage="parse",
                 status=200,
@@ -200,14 +243,19 @@ class OpenBaoSecretProvider:
         Strips query, fragment, and embedded credentials. Only base URL + path
         are returned. Defensive even though the adapter never constructs URLs
         with query strings, fragments, or embedded credentials.
+
+        I1: IPv6 hosts (``parsed.hostname`` returns ``"::1"`` without brackets)
+        are re-wrapped in brackets so the rebuilt URL stays well-formed.
         """
         path = self._path_template.format(workspace_id=workspace_id)
         raw = f"{self._endpoint}/v1/{self._mount}/data/{path}"
         parsed = urlparse(raw)
         # Rebuild with only scheme + netloc (stripped of user:pass) + path
-        safe_netloc = parsed.hostname or ""
-        if parsed.port:
-            safe_netloc = f"{safe_netloc}:{parsed.port}"
+        host = parsed.hostname or ""
+        if ":" in host:  # IPv6 literal — wrap in brackets per RFC 3986 §3.2.2
+            host = f"[{host}]"
+        port_part = f":{parsed.port}" if parsed.port else ""
+        safe_netloc = f"{host}{port_part}"
         safe = urlunparse((parsed.scheme, safe_netloc, parsed.path, "", "", ""))
         return safe
 
