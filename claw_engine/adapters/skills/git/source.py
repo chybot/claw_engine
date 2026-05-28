@@ -100,14 +100,8 @@ def _validate_allowed_path(p: str) -> None:
 
 def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
     """Run a git command; raise GitSkillSourceError on non-zero exit or missing git."""
-    # The stage is inferred from the first argument (clone, fetch, checkout, …).
+    # The stage label is the first argument (clone, fetch, checkout, sparse-checkout, …).
     stage = args[0] if args else "invoke"
-    # Remap a few compound first-args to a single stage label.
-    _stage_map = {
-        "sparse-checkout": "sparse-checkout",
-    }
-    if stage == "sparse-checkout":
-        pass  # keep as-is
     try:
         result = subprocess.run(
             ["git", *args],
