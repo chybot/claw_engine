@@ -9,6 +9,7 @@ dev = ["pytest>=8", "ruff>=0.6"]
 otel = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
 skills-git = []  # no Python deps; uses system git CLI
 identity-casbin = ["casbin>=1.30"]
+secrets-openbao = ["requests>=2.30"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -20,3 +21,6 @@ include = ["claw_engine*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "integration: requires running infrastructure (testcontainers) — skipped in default CI",
+]
