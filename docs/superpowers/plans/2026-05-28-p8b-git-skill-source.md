@@ -23,12 +23,16 @@ Three phases, **strict separation**:
 
 | Phase | Methods | Allowed | Forbidden |
 |---|---|---|---|
-| **Construction** | `__init__(repo_url, ref, cache_dir, *, allowed_skill_paths=None, eager=False)` | argument validation, path normalisation | network, disk write |
+| **Construction** | `__init__(repo_url, ref, cache_dir, *, allowed_skill_paths=None)` | argument validation, path normalisation | **network, disk write, subprocess** — no exceptions |
 | **Refresh** | `refresh() -> RefreshResult` | git subprocess, write to `cache_dir` | reading skill content |
 | **Read** | `has_skill / has_dir / skill_dir / iter_skills (optional)` | read `cache_dir` only | network, disk write, subprocess |
 
-**Eager mode** (`eager=True`): constructor calls `refresh()` exactly once. Default `eager=False`
-keeps construction hermetic — caller decides when to materialize.
+**Construction is ALWAYS hermetic — no `eager` mode (corrected 2026-05-28)**: original draft had
+an `eager=True` flag that ran `refresh()` from `__init__`. That violated the construction-phase
+boundary above and would make adapter composition / DI roots implicit IO points (broken timeout,
+credentials, error attribution, retry control). The flag has been removed. **Caller must call
+`refresh()` explicitly** — no shortcuts. The acceptance test (§8 #1) monkey-patches `subprocess.run`
+to fail; constructing `GitSkillSource(...)` with any kwargs must succeed without invoking it.
 
 **Idempotency of `refresh()`**:
 - Second call with **same `ref`** → checks out same commit; resolves to a no-op if cache already
@@ -55,20 +59,20 @@ class GitSkillSource:
         cache_dir: str | Path,
         *,
         allowed_skill_paths: Sequence[str] | None = None,
-        eager: bool = False,
     ) -> None:
-        # validate inputs, store, optionally refresh
+        # validate inputs and store — NO IO, NO subprocess
 ```
 
 | Param | Validation | Notes |
 |---|---|---|
 | `repo_url` | non-empty string; no further validation (git CLI rejects garbage) | supports `https://`, `git@`, `file://` (latter for fixtures) |
 | `ref` | non-empty string | branch / tag / commit SHA |
-| `cache_dir` | converted to `Path`; created if missing on `refresh()` | NOT validated to be empty / pre-existing |
-| `allowed_skill_paths` | each entry passes path-traversal validation (see §5.1); skill-name basename also passes `validate_skill_name` | when `None` (default), `refresh()` does a full clone and `read` methods scan the repo root one-level deep, treating each top-level directory as a skill candidate. Pass an explicit list only when the repo is large or contains non-skill content. **Both code paths must be tested.** |
-| `eager` | bool | when True, `__init__` calls `self.refresh()`; failure propagates |
+| `cache_dir` | converted to `Path`; created on `refresh()` if missing | NOT validated to be empty / pre-existing; **NOT mkdir'd in `__init__`** |
+| `allowed_skill_paths` | each entry passes path-traversal validation (see §5.1); skill-name basename also passes `validate_skill_name` (note: §5.1 validation may run in `__init__` since it is pure-string, no IO) | when `None` (default), `refresh()` does a full clone and `read` methods scan the repo root one-level deep, treating each top-level directory as a skill candidate. Pass an explicit list only when the repo is large or contains non-skill content. **Both code paths must be tested.** |
 
-Constructor must not touch `cache_dir` when `eager=False` — that's the hermetic contract.
+**No `eager` parameter** (removed 2026-05-28 — see §1). The constructor never touches `cache_dir`,
+never invokes subprocess, never makes a network call. Caller calls `refresh()` explicitly when
+they're ready to materialize.
 
 ---
 
@@ -285,10 +289,12 @@ get the same content in a regular directory.
 
 ### Lifecycle invariants (`tests/adapters/test_git_skill_source.py`)
 
-1. **No-IO construction**: `GitSkillSource("file:///nonexistent.git", "main", tmp_path)` with
-   `eager=False` does NOT raise (no network attempt). `has_skill("x") is False` (no error).
-2. **Eager construction**: `eager=True` triggers refresh on a valid bare repo; assertions pass
-   after construction.
+1. **No-IO construction (acceptance-critical)** ⭐: `GitSkillSource("file:///nonexistent.git", "main", tmp_path)`
+   does NOT raise and does NOT invoke `subprocess.run`. Monkey-patch `subprocess.run` to bomb;
+   construction must succeed with any combination of valid kwargs. Post-construction,
+   `has_skill("x") is False` (no error). This invariant has no exceptions — no `eager` mode.
+2. **Construction does not create `cache_dir`** ⭐: pass a non-existent `cache_dir` path; after
+   construction, `cache_dir.exists()` is False. Only `refresh()` creates it.
 3. **Pre-refresh hermetic** ⭐ **acceptance-critical**: `has_skill`, `has_dir`, `skill_dir`
    never invoke subprocess. Monkey-patch `subprocess.run` to raise on call; all three read
    methods must succeed (return `False` or raise `SkillNotFound`), proving they take no git path.
@@ -389,7 +395,11 @@ the `skills-git` extra since it has no Python imports to skip on.
 
 ## 12. Locked Decisions (2026-05-28)
 
-User dispatched these decisions instead of waiting for a confirm round:
+User dispatched these decisions instead of waiting for a confirm round.
+
+**Correction (2026-05-28, post-PR2 review):** original §1/§2 mentioned an `eager=True` mode that
+ran `refresh()` from `__init__`. That contradicted the same section's "construction = no IO"
+boundary. Removed entirely — see §1, §2, §8 #1, #2.
 
 1. **`allowed_skill_paths=None` default kept** — semantics = "scan repo root one level for skill
    candidates"; explicit list = "use these exact paths (flat or nested)". **Both code paths
