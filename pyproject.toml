@@ -10,6 +10,9 @@ otel = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
 skills-git = []  # no Python deps; uses system git CLI
 identity-casbin = ["casbin>=1.30"]
 secrets-openbao = ["requests>=2.30"]
+persistence-sqlalchemy = ["sqlalchemy>=2.0"]
+persistence-mysql = ["sqlalchemy>=2.0", "pymysql>=1.1"]
+persistence-postgres = ["sqlalchemy>=2.0", "psycopg[binary]>=3.1"]
 
 [build-system]
 requires = ["setuptools>=68"]

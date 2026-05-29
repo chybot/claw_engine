@@ -129,9 +129,47 @@ def test_parse_inbound_detects_slash_command():
 def test_parse_inbound_malformed_raises_value_error():
     ch = SeaTalkChannel(SECRET)
     with pytest.raises(ValueError):
-        ch.parse_inbound(json.dumps({"event_type": "x"}))    # 缺 event/message/text
-    with pytest.raises(ValueError):
         ch.parse_inbound("not json {{{")
+    with pytest.raises(ValueError):
+        # 正确 event_type 但缺 event 内层结构
+        ch.parse_inbound(json.dumps({"event_type": "message_from_bot_subscriber"}))
+
+def test_parse_inbound_rejects_non_target_event_type():
+    """非目标 SeaTalk event 不应进 engine（防止任意 event 凑字段绕过）。"""
+    ch = SeaTalkChannel(SECRET)
+    bad = json.dumps({
+        "event_type": "bot_added_to_group_chat",   # 任何非目标 event_type
+        "event": {
+            "message": {"text": {"plain_text": "hi"}, "tag": "text"},
+            "sender": {"email": "a@b"}, "thread_id": "t", "message_id": "m",
+        },
+    })
+    with pytest.raises(ValueError, match="event_type"):
+        ch.parse_inbound(bad)
+
+def test_parse_inbound_rejects_non_text_message_tag():
+    """V1 只处理 text；image/file 等显式拒绝（不在此路径静默处理）。"""
+    ch = SeaTalkChannel(SECRET)
+    bad = json.dumps({
+        "event_type": "message_from_bot_subscriber",
+        "event": {
+            "message": {"tag": "image", "image": {"url": "x"}},
+            "sender": {"email": "a@b"}, "thread_id": "t", "message_id": "m",
+        },
+    })
+    with pytest.raises(ValueError, match="tag"):
+        ch.parse_inbound(bad)
+
+def test_signature_with_non_ascii_body_locks_byte_semantics():
+    """signature 计算与 parse 使用同一 raw str；non-ASCII body 不应破坏一致性。"""
+    ch = SeaTalkChannel(SECRET)
+    body = _payload(text="你好世界")
+    ch.verify_inbound(body, {"Signature": _sig(body)})   # 不抛即通过
+    msg = ch.parse_inbound(body)
+    assert msg.text == "你好世界"
+    # 用错的 raw（不同字符）算签名 → 必拒
+    with pytest.raises(InboundAuthError):
+        ch.verify_inbound(body, {"Signature": _sig(_payload(text="不同的"))})
 
 def test_send_text_and_progress_captured():
     ch = SeaTalkChannel(SECRET)
@@ -189,9 +227,19 @@ class SeaTalkChannel:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise ValueError(f"malformed SeaTalk body: {exc}") from exc
+        # 显式拒绝非目标 event_type（防任意 SeaTalk event 凑出字段就进 engine）
+        if payload.get("event_type") != "message_from_bot_subscriber":
+            raise ValueError(f"unsupported SeaTalk event_type: {payload.get('event_type')!r}")
         try:
             event = payload["event"]
-            text = event["message"]["text"]["plain_text"]
+            message = event["message"]
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"SeaTalk payload 缺少 event/message: {exc}") from exc
+        # V1 只处理 text 消息——非 text(image/file/...) 显式拒绝，不在此 path 静默吞
+        if message.get("tag") != "text":
+            raise ValueError(f"unsupported SeaTalk message tag: {message.get('tag')!r}")
+        try:
+            text = message["text"]["plain_text"]
             email = event["sender"]["email"]
             thread = event["thread_id"]
         except (KeyError, TypeError) as exc:
@@ -224,7 +272,7 @@ class SeaTalkChannel:
 - [ ] **Step 4: PASS（6 passed）+ 全量 + purity + ruff**
 
 Run: `.venv/bin/pytest tests/test_seatalk_channel.py -q && .venv/bin/pytest -q && .venv/bin/pytest tests/purity -q && .venv/bin/ruff check claw_engine tests`
-Expected: 6 passed；全量 PASS；purity 2 passed（"seatalk" 字面量在 adapters，不污染 engine）；All checks passed
+Expected: 9 passed；全量 PASS；purity 2 passed（"seatalk" 字面量在 adapters，不污染 engine）；All checks passed
 
 - [ ] **Step 5: Commit**
 
@@ -235,10 +283,39 @@ git commit -m "feat: add SeaTalkChannel adapter (sha256 signature, hermetic capt
 
 ---
 
-### Task 2: SeaTalk 全链路 e2e + RBAC 拒绝 + 真 dag_tracer provisioning
+### Task 2: SeaTalk 全链路 e2e + RBAC 拒绝 + dag_tracer provisioning（fixture 必跑 + 真路径 enhanced）
 
 **Files:**
+- Create: `tests/fixtures/algo_skills/dag_tracer/SKILL.md`
+- Create: `tests/fixtures/algo_skills/dag_tracer/scripts/diagnose_search_trace.py`
 - Test: `tests/test_seatalk_chain_e2e.py`
+
+- [ ] **Step 0: 建 fixture（从 algo-bot-skills 结构抽取最小可信副本，入 repo 必跑）**
+
+```markdown
+<!-- tests/fixtures/algo_skills/dag_tracer/SKILL.md -->
+---
+name: dag_tracer
+description: >-
+  诊断商品搜索 trace 的 DAG 漏斗与 item 状态。
+  Minimal fixture extracted from algo-bot-skills/algo/dag_tracer/ for the P7
+  portability proof. The full skill lives in the algo-bot-skills repository;
+  this fixture preserves the file shape (frontmatter + body + scripts/) the V1
+  SkillProvisioner must handle.
+---
+
+# DAG Tracer (test fixture)
+
+Provisioned by `SkillProvisioner` to `cwd/.agents/skills/dag_tracer/` to prove
+the V1 chain can land a real-shape skill on disk. The fixture is intentionally
+minimal — full diagnostic logic lives upstream.
+```
+
+```python
+#!/usr/bin/env python3
+# tests/fixtures/algo_skills/dag_tracer/scripts/diagnose_search_trace.py
+"""Stub fixture for the P7 portability proof — not meant to be executed."""
+```
 
 - [ ] **Step 1: 写失败测试（3 个用例，机器路径有 skipif guard）**
 
@@ -387,6 +464,18 @@ def test_happy_path_full_seatalk_chain(tmp_path):
     assert "PLAIN-SECRET" not in repr(rec.dims)
 
 
+def test_bad_signature_blocks_seatalk_chain(tmp_path):
+    """verify-before-engine invariant 在 SeaTalk 链上同样成立（镜像 P6a webhook 安全测试）：
+    坏签名 → InboundAuthError，backend 不跑，channel 无回复。"""
+    from claw_engine.engine.channels.contracts import InboundAuthError
+    runner, channel, spy, _, _, _, _ = _build_runner(tmp_path)
+    body = _payload(text="hello")
+    with pytest.raises(InboundAuthError):
+        runner.handle_raw(body, {"Signature": "wrong-digest"})
+    assert spy.req is None
+    assert channel.sent_texts == []
+
+
 def test_rbac_unauthorized_user_no_backend_no_reply(tmp_path):
     """用户被移出 workspace 授权 -> Identity 路由抛 WorkspaceAccessDenied；
     backend 从未运行，channel 无回复。"""
@@ -398,14 +487,44 @@ def test_rbac_unauthorized_user_no_backend_no_reply(tmp_path):
     assert channel.sent_texts == []                                 # 无回复发出
 
 
-@pytest.mark.skipif(not (ALGO_BOT_SKILLS / REAL_SKILL_NAME).exists(),
-                    reason=f"algo-bot-skills not available at {ALGO_BOT_SKILLS}")
-def test_provision_real_dag_tracer_skill_into_workspace(tmp_path):
-    """从 algo-bot-skills 拷贝真 dag_tracer skill，跑 SkillProvisioner，
-    断言真实文件落到 cwd/.agents/skills/dag_tracer/。证明 V1 能处理真世界 SKILL.md。"""
+# --- skill provisioning 双层 proof：fixture 必跑 + 真路径 enhanced ---
+
+FIXTURE_DAG_TRACER = Path(__file__).parent / "fixtures" / "algo_skills" / "dag_tracer"
+
+def test_provision_fixture_dag_tracer_skill_into_workspace(tmp_path):
+    """**默认必跑** proof：用 repo 里的 fixture（从真 algo-bot-skills 抽取最小副本），
+    证明 V1 SkillProvisioner 能处理真实 SKILL.md 结构 + 落盘 + manifest。
+    不依赖任何本机外部路径——这是核心 portability proof。"""
     runner, _, _, _, identity, resolver, cwd = _build_runner(tmp_path)
 
-    # 拷真 dag_tracer 到 tmp source（hermetic：不读写本机 algo-bot-skills 之外）
+    src_root = tmp_path / "skills_src"
+    src_root.mkdir()
+    shutil.copytree(FIXTURE_DAG_TRACER, src_root / "dag_tracer")
+
+    provisioner = SkillProvisioner(LocalDirSkillSource(str(src_root)), identity)
+    user = identity.resolve_user("alice@shopee.com")
+    ws = resolver.resolve("ws1", user_id="u1")
+    result = provisioner.provision(ws, user)
+
+    assert result.provisioned == ("dag_tracer",)
+    assert result.denied == () and result.missing == () and result.invalid == ()
+
+    dst = cwd / ".agents" / "skills" / "dag_tracer"
+    assert (dst / "SKILL.md").is_file()
+    assert (dst / "scripts" / "diagnose_search_trace.py").is_file()
+    # SKILL.md 真有 frontmatter（不是空文件）
+    content = (dst / "SKILL.md").read_text(encoding="utf-8")
+    assert content.startswith("---")
+    assert "name: dag_tracer" in content
+
+
+@pytest.mark.skipif(not (ALGO_BOT_SKILLS / REAL_SKILL_NAME).exists(),
+                    reason=f"algo-bot-skills not available at {ALGO_BOT_SKILLS} — fixture test above is the must-run proof")
+def test_provision_real_dag_tracer_skill_into_workspace(tmp_path):
+    """**enhanced** proof：本机有 algo-bot-skills 时额外跑真路径。
+    跳过不影响 P7 验收——上面 fixture 测试已经是 must-run proof。"""
+    runner, _, _, _, identity, resolver, cwd = _build_runner(tmp_path)
+
     src_root = tmp_path / "skills_src"
     src_root.mkdir()
     shutil.copytree(ALGO_BOT_SKILLS / REAL_SKILL_NAME, src_root / REAL_SKILL_NAME)
@@ -416,15 +535,11 @@ def test_provision_real_dag_tracer_skill_into_workspace(tmp_path):
     result = provisioner.provision(ws, user)
 
     assert result.provisioned == ("dag_tracer",)
-    assert result.denied == () and result.missing == () and result.invalid == ()
-
-    # 真文件落盘
     dst = cwd / ".agents" / "skills" / "dag_tracer"
     assert (dst / "SKILL.md").is_file()
-    assert (dst / "scripts" / "diagnose_search_trace.py").is_file()  # algo-bot-skills 已知文件
-    # SKILL.md 内容是真的（不是空文件）
+    assert (dst / "scripts" / "diagnose_search_trace.py").is_file()
     content = (dst / "SKILL.md").read_text(encoding="utf-8")
-    assert "dag_tracer" in content or "diagnose" in content.lower() or len(content) > 100
+    assert len(content) > 100   # 真 SKILL.md 内容显著大于 fixture
 ```
 
 - [ ] **Step 2: 跑确认 FAIL**
@@ -441,13 +556,21 @@ Expected: FAIL（ImportError: SeaTalkChannel 还没建 / 或本 task 之前未�
 - [ ] **Step 4: PASS + 最终全量 + purity + ruff（P7 验收）**
 
 Run: `.venv/bin/pytest tests/test_seatalk_chain_e2e.py -v && .venv/bin/pytest -q && .venv/bin/pytest tests/purity -q && .venv/bin/ruff check claw_engine tests`
-Expected: 3 passed（或 2 passed + dag_tracer skipped 视本机路径而定）；全量 PASS；purity 2 passed（engine 仍 0 业务/CLI 字面量；"seatalk" 只在 adapters/tests）；All checks passed
+Expected: **5 passed（must-run proof）** 或 **4 passed + 1 skipped**（本机无 algo-bot-skills 时真路径 skip，fixture 测试仍跑且仍是核心证据）；全量 PASS；purity 2 passed（engine 仍 0 业务/CLI 字面量；"seatalk" 只在 adapters/tests）；All checks passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/test_seatalk_chain_e2e.py
-git commit -m "test: e2e SeaTalk chain portability proof (happy + RBAC + real dag_tracer provisioning)"
+git add tests/fixtures/algo_skills/dag_tracer/ tests/test_seatalk_chain_e2e.py
+git commit -m "test: e2e SeaTalk chain portability proof
+
+- happy path: SeaTalk payload -> ChannelGateway -> Identity -> WorkspaceResolver
+  -> spy backend -> reply; assert real secret reaches backend env, redacted
+  reaches trace, full TraceDims populated
+- bad signature blocks chain at verify-before-engine gate (mirror P6a invariant)
+- unauthorized user denied via WorkspaceAccessDenied; backend not run, no reply
+- fixture-based dag_tracer provisioning (must-run, no machine dependency)
+- real-path dag_tracer provisioning (skipif enhanced proof on dev box only)"
 ```
 
 ---
@@ -461,6 +584,11 @@ git commit -m "test: e2e SeaTalk chain portability proof (happy + RBAC + real da
 - RBAC 拒绝时 backend 不跑、不回复 → T2 `test_rbac_unauthorized_user_no_backend_no_reply` ✅
 - 真 algo-bot-skills SKILL.md 能被 V1 SkillProvisioner 处理 → T2 `test_provision_real_dag_tracer_skill_into_workspace` ✅
 - SeaTalk seam 真的可插（adapters/，不动 engine）→ T1 adapter + purity gate ✅
+- 加固A（event_type 必须是目标值）→ T1 `test_parse_inbound_rejects_non_target_event_type` ✅
+- 加固B（message tag 必须是 text，非 text 显式拒绝）→ T1 `test_parse_inbound_rejects_non_text_message_tag` ✅
+- 加固C（签名/解析使用同一 raw str，non-ASCII 锁住字节语义）→ T1 `test_signature_with_non_ascii_body_locks_byte_semantics` ✅
+- 加固D（dag_tracer 必跑 fixture，不依赖机器路径；真路径作 enhanced 不替代核心 proof）→ T2 `test_provision_fixture_dag_tracer_skill_into_workspace`(must-run) + `test_provision_real_dag_tracer_skill_into_workspace`(skipif enhanced) + `tests/fixtures/algo_skills/dag_tracer/` 入 repo ✅
+- 加固E（verify-before-engine invariant 在 SeaTalk 链上也成立）→ T2 `test_bad_signature_blocks_seatalk_chain` runner 级 ✅
 
 **2. Placeholder scan：** 无 TBD/TODO；每个 code step 含完整代码（测试片段避免 `a; b` 复合语句）。✅
 
