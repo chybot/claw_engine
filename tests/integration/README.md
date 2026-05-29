@@ -61,8 +61,9 @@ Default CI MUST use `-m "not integration"`:
 pytest -q -m "not integration"
 ```
 
-Bare `pytest -q` collects integration-marked tests and **fails without Docker**
-because `pyproject.toml` does NOT set `addopts` to filter them out (by design —
+Bare `pytest -q` collects integration-marked tests; without Docker, those cases
+skip gracefully via fixture gating. Default CI still filters them out because
+`pyproject.toml` does NOT set `addopts` to do that automatically (by design —
 see sub-plan §2.4).
 
 ## Skip behaviour
