@@ -13,6 +13,7 @@ secrets-openbao = ["requests>=2.30"]
 persistence-sqlalchemy = ["sqlalchemy>=2.0"]
 persistence-mysql = ["sqlalchemy>=2.0", "pymysql>=1.1"]
 persistence-postgres = ["sqlalchemy>=2.0", "psycopg[binary]>=3.1"]
+integration = ["testcontainers[postgres]>=4.0"]  # postgres only; mysql defers to P9a.1
 
 [build-system]
 requires = ["setuptools>=68"]
