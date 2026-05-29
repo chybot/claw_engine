@@ -19,115 +19,165 @@ Fixture scoping decision (§14 #14 of P9a sub-plan):
   helpers are shared across the suite — top-level conftest is the conventional
   location for repo-wide shared fixtures.
 
-  tests/integration/conftest.py only holds the pytest.importorskip guard and
-  re-exports via import from here to avoid duplication. (See that file for details.)
+Install-matrix robustness (P9a code-review round 2):
+  Fixtures are defined UNCONDITIONALLY. Optional-dependency gating happens
+  INSIDE the fixture body via pytest.importorskip — when testcontainers is
+  missing, importorskip raises Skipped and pytest converts that into a clean
+  skip for any test requesting the fixture (not a "fixture not found" error).
+  This matters for the partial-install case: sqlalchemy installed but
+  testcontainers missing — the sqlalchemy-postgres parametrize case in
+  tests/contract/test_sessionstore_contract.py must skip cleanly, not error.
 """
 from __future__ import annotations
 
 import os
 import uuid
 from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# testcontainers guard
-# ---------------------------------------------------------------------------
-# pytest.importorskip at module level would skip the entire conftest (including
-# non-integration tests). Instead we guard only the fixtures themselves — if
-# testcontainers is missing, the fixtures simply don't exist and tests requesting
-# them get a "fixture not found" error (which is fine; they'll also have
-# pytest.importorskip at the test-module level).
-#
-# We use a try/except here rather than importorskip so that the baseline (non-
-# integration) suite keeps running normally when testcontainers is not installed.
-try:
+if TYPE_CHECKING:  # pragma: no cover — type-only import
     from testcontainers.postgres import PostgresContainer
-    from testcontainers.core.config import testcontainers_config as _tc_config  # noqa: F401
-    _TC_AVAILABLE = True
-    # Colima / Rancher Desktop expose Docker via a non-standard socket path that
-    # Ryuk (the testcontainers resource cleanup daemon) cannot mount. Disable Ryuk
-    # when DOCKER_HOST points to a non-standard socket — Ryuk is optional (it just
-    # cleans up orphaned containers; pytest teardown handles cleanup anyway via the
-    # context-manager protocol in postgres_container). Standard Docker Desktop still
-    # works with Ryuk enabled (default).
-    _docker_host = os.environ.get("DOCKER_HOST", "")
-    if _docker_host and "/var/run/docker.sock" not in _docker_host:
-        _tc_config.ryuk_disabled = True
-except ImportError:
-    _TC_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Configuration constants (read at module load — applied lazily inside fixtures)
+# ---------------------------------------------------------------------------
 
 # Pinned to a specific minor for full reproducibility (not `:16-alpine` floating tag).
 # Bump explicitly in a follow-up PR; do NOT change to a floating tag.
 _POSTGRES_IMAGE = "postgres:16.4-alpine"
 
-# Container startup timeout (seconds). Override via env for slower CI runners.
+# Container startup timeout in seconds. Override via env for slower CI runners.
+# Wired into testcontainers_config.timeout inside postgres_container().
 _TC_TIMEOUT = int(os.environ.get("CLAW_TC_TIMEOUT_SECONDS", "60"))
 
 
-if _TC_AVAILABLE:
-    @pytest.fixture(scope="session")
-    def postgres_container() -> "Iterator[PostgresContainer]":
-        """Start a Postgres container once per pytest session, reused across all tests.
+# ---------------------------------------------------------------------------
+# Fixtures (UNCONDITIONAL — gating happens inside the body via importorskip)
+# ---------------------------------------------------------------------------
 
-        Image: postgres:16.4-alpine (pinned minor — see _POSTGRES_IMAGE).
-        Startup timeout: 60s (override with CLAW_TC_TIMEOUT_SECONDS env var).
 
-        Skips gracefully if Docker daemon is not available.
-        """
-        try:
-            container = PostgresContainer(
-                image=_POSTGRES_IMAGE,
-                username="test",
-                password="test",
-                dbname="test",
-            )
-            with container as c:
-                yield c
-        except Exception as exc:  # noqa: BLE001
-            # Covers: docker.errors.DockerException, requests.exceptions.ConnectionError,
-            # and any testcontainers startup failure.
-            pytest.skip(f"Docker daemon not available or container failed to start: {exc}")
+@pytest.fixture(scope="session")
+def postgres_container() -> Iterator["PostgresContainer"]:
+    """Start a Postgres container once per pytest session, reused across all tests.
 
-    @pytest.fixture
-    def postgres_url(
-        postgres_container: "PostgresContainer",
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> str:
-        """Return a credential-free DSN and set PGUSER/PGPASSWORD env vars.
+    Image: postgres:16.4-alpine (pinned minor — see _POSTGRES_IMAGE).
+    Startup timeout: 60s (override with CLAW_TC_TIMEOUT_SECONDS env var).
 
-        The URL form is:
-            postgresql+psycopg://{host}:{port}/{db}
-        — no user:pass@ embedded (required by P8e HC-C which rejects DSNs with
-        embedded credentials).
+    Skip behaviour (matters for the install matrix):
+      - testcontainers not installed → importorskip → clean Skipped (not error)
+      - Docker daemon unreachable → except Exception → clean pytest.skip
+      - Container start succeeds but image pull fails → same path → clean skip
 
-        psycopg/libpq picks up credentials from PGUSER + PGPASSWORD env vars at
-        connect time (documented libpq env-var fallback). monkeypatch ensures the
-        env vars are restored after each test (function scope).
+    The driver="psycopg" kwarg is CRITICAL: testcontainers' PostgresContainer
+    defaults driver="psycopg2", but pyproject installs psycopg[binary] (v3) via
+    [persistence-postgres]. Without driver="psycopg", the readiness probe tries
+    `import psycopg2`, ImportErrors, the exception bubbles up here, gets caught
+    by our except, and converts to pytest.skip("Docker daemon not available…")
+    — a silent false-green where Postgres tests never actually run. See P9a PR
+    code review P1-#3 for the original observation.
+    """
+    # Optional-dependency gate INSIDE the fixture (not at module top) so that
+    # this conftest stays importable in a clean .[dev] install where
+    # testcontainers is absent. Any test requesting this fixture then gets a
+    # clean skip with this reason.
+    pytest.importorskip(
+        "testcontainers",
+        reason=(
+            "testcontainers not installed — integration tests require Docker. "
+            "Install with: pip install -e '.[persistence-postgres,integration]'"
+        ),
+    )
 
-        See sub-plan §1.1 for the full rationale; §3 for this fixture design.
-        """
-        host = postgres_container.get_container_host_ip()
-        port = postgres_container.get_exposed_port(5432)
-        db = postgres_container.dbname
-        user = postgres_container.username
-        password = postgres_container.password
+    from testcontainers.core.config import testcontainers_config as tc_config
+    from testcontainers.postgres import PostgresContainer
 
-        # Set env vars so libpq reads them (monkeypatch auto-restores after test).
-        monkeypatch.setenv("PGUSER", user)
-        monkeypatch.setenv("PGPASSWORD", password)
+    # Wire CLAW_TC_TIMEOUT_SECONDS to testcontainers' wait-loop timeout.
+    # testcontainers computes effective timeout as `max_tries * sleep_time`
+    # (sleep_time defaults to 1.0s). `timeout` itself is a read-only derived
+    # property — we set max_tries to achieve the requested timeout in seconds.
+    tc_config.max_tries = int(_TC_TIMEOUT / max(tc_config.sleep_time, 0.1))
 
-        # Construct credential-free DSN (no user:pass@); host + port + db only.
-        # Do NOT use postgres_container.get_connection_url() — it returns
-        # postgresql+psycopg2://user:pass@host:port/db which embeds credentials
-        # and uses the wrong driver name.
-        return f"postgresql+psycopg://{host}:{port}/{db}"
+    # Colima / Rancher Desktop expose Docker via a non-standard socket path
+    # that Ryuk (the testcontainers resource cleanup daemon) cannot mount.
+    # Disable Ryuk when DOCKER_HOST points to a non-standard socket — Ryuk is
+    # optional (it just cleans up orphaned containers; pytest teardown handles
+    # cleanup via the context-manager protocol below). Standard Docker Desktop
+    # still works with Ryuk enabled (default).
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    if docker_host and "/var/run/docker.sock" not in docker_host:
+        tc_config.ryuk_disabled = True
 
-    @pytest.fixture
-    def unique_table_prefix() -> str:
-        """Generate a per-test table prefix ('test_<8 hex chars>_') for isolation.
+    try:
+        container = PostgresContainer(
+            image=_POSTGRES_IMAGE,
+            username="test",
+            password="test",
+            dbname="test",
+            # P1-#3: use psycopg v3 driver to match what [persistence-postgres]
+            # installs. Without this, the readiness probe ImportErrors on
+            # psycopg2 and tests silently skip.
+            driver="psycopg",
+        )
+        with container as c:
+            yield c
+    except Exception as exc:  # noqa: BLE001
+        # Covers: docker.errors.DockerException, requests.exceptions.ConnectionError,
+        # and any testcontainers startup failure (image pull, network, etc.).
+        pytest.skip(f"Docker daemon not available or container failed to start: {exc}")
 
-        Each test gets its own prefix so tests are independent and can run in the
-        same Postgres instance without state leaking between them.
-        """
-        return f"test_{uuid.uuid4().hex[:8]}_"
+
+@pytest.fixture
+def postgres_url(
+    postgres_container: "PostgresContainer",
+    monkeypatch: pytest.MonkeyPatch,
+) -> str:
+    """Return a credential-free DSN and set PGUSER/PGPASSWORD env vars.
+
+    The URL form is:
+        postgresql+psycopg://{host}:{port}/{db}
+    — no user:pass@ embedded (required by P8e HC-C which rejects DSNs with
+    embedded credentials).
+
+    psycopg/libpq picks up credentials from PGUSER + PGPASSWORD env vars at
+    connect time (documented libpq env-var fallback). monkeypatch ensures the
+    env vars are restored after each test (function scope).
+
+    Automatic skip: if postgres_container skipped (testcontainers missing or
+    Docker unreachable), this fixture inherits the skip — tests get a clean
+    skip, not a fixture-resolution error.
+
+    See sub-plan §1.1 for the full rationale; §3 for this fixture design.
+    """
+    host = postgres_container.get_container_host_ip()
+    port = postgres_container.get_exposed_port(5432)
+    db = postgres_container.dbname
+    user = postgres_container.username
+    password = postgres_container.password
+
+    # Set env vars so libpq reads them (monkeypatch auto-restores after test).
+    monkeypatch.setenv("PGUSER", user)
+    monkeypatch.setenv("PGPASSWORD", password)
+
+    # Construct credential-free DSN (no user:pass@); host + port + db only.
+    # Do NOT use postgres_container.get_connection_url() — it returns a URL
+    # with embedded user:pass@ which would fail P8e HC-C validation.
+    return f"postgresql+psycopg://{host}:{port}/{db}"
+
+
+@pytest.fixture
+def unique_table_prefix() -> str:
+    """Generate a per-test table prefix ('test_<8 hex chars>_') for isolation.
+
+    Each test gets its own prefix so tests are independent and can run in the
+    same Postgres instance without state leaking between them.
+
+    No testcontainers dependency — safe to use independent of Docker.
+    """
+    return f"test_{uuid.uuid4().hex[:8]}_"
+
+
+# Silence unused-import warning when TYPE_CHECKING is False at runtime.
+_ = Any

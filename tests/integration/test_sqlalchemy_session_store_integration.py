@@ -23,9 +23,20 @@ import threading
 import uuid
 
 import pytest
-import sqlalchemy
 
-# Gate: entire module skipped unless testcontainers is installed.
+# Gate ALL optional imports — collection must succeed under a clean .[dev] install
+# where neither sqlalchemy nor testcontainers is present. importorskip raises
+# Skipped during collection, which pytest handles cleanly (module skipped, no error).
+# Order matters: sqlalchemy first because every heavy import below transitively
+# needs it; testcontainers second because the fixtures (in tests/conftest.py)
+# already guard their own usage.
+pytest.importorskip(
+    "sqlalchemy",
+    reason=(
+        "sqlalchemy not installed — integration tests require the SQLAlchemy adapter. "
+        "Install with: pip install -e '.[persistence-postgres,integration]'"
+    ),
+)
 pytest.importorskip(
     "testcontainers",
     reason=(
@@ -33,6 +44,9 @@ pytest.importorskip(
         "Install with: pip install -e '.[persistence-postgres,integration]'"
     ),
 )
+
+# Safe to import the heavy stuff now (both gates passed).
+import sqlalchemy  # noqa: E402
 
 from claw_engine.adapters.persistence.sqlalchemy import SQLAlchemySessionStore  # noqa: E402
 
