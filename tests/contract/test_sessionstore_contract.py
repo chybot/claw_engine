@@ -3,10 +3,11 @@ from claw_engine.engine.persistence.memory_store import MemorySessionStore
 from claw_engine.engine.persistence.sqlite_store import SqliteSessionStore
 from tests.contract import sessionstore_contract as sc
 
-# HC-D: Include sqlalchemy-sqlite if sqlalchemy is available (default CI).
+# HC-D: Include sqlalchemy-sqlite in the contract suite if sqlalchemy is
+# available (default CI).  When sqlalchemy is NOT installed, the memory +
+# sqlite cases below must still run — so we conditionally extend the
+# parametrize list rather than gating the whole module.
 # mysql/postgres are gated behind @pytest.mark.integration in tests/integration/.
-_sqlalchemy = pytest.importorskip("sqlalchemy", reason="sqlalchemy not installed") if True else None
-
 try:
     import claw_engine.adapters.persistence.sqlalchemy  # noqa: F401
     _SA_AVAILABLE = True

@@ -6,16 +6,23 @@ Never impersonates engine exceptions. Stage taxonomy:
 """
 from __future__ import annotations
 
+_VALID_STAGES: frozenset[str] = frozenset({"init", "query"})
+
 
 class SessionStoreError(Exception):
     """Raised when SQLAlchemySessionStore encounters an unrecoverable error.
 
     Attributes:
-        stage: which phase failed — one of 'init', 'query'.
+        stage: which phase failed — one of 'init', 'query', or None.
         message: human-readable description; MUST NOT contain credentials.
     """
 
     def __init__(self, message: str, *, stage: str | None = None) -> None:
+        if stage is not None and stage not in _VALID_STAGES:
+            raise ValueError(
+                f"stage must be one of {sorted(_VALID_STAGES)} or None, "
+                f"got {stage!r}"
+            )
         super().__init__(message)
         self.stage = stage
 

@@ -10,17 +10,29 @@ import sqlalchemy
 
 def _build_tables(
     prefix: str,
+    *,
+    schema: str | None = None,
 ) -> tuple[sqlalchemy.Table, sqlalchemy.Table]:
     """Return (sessions_table, processed_messages_table) bound to a fresh MetaData.
 
     Args:
         prefix: table name prefix, e.g. "claw_".  Empty string is allowed.
+        schema: schema name to qualify both tables (Postgres).  None → no
+            qualification (sqlite / mysql ignore schema or use default).
 
     Returns:
         Tuple of (sessions table, processed_messages table).  The MetaData
         linking them is accessible via either table's ``.metadata`` attribute.
     """
-    metadata = sqlalchemy.MetaData()
+    metadata = sqlalchemy.MetaData(schema=schema)
+
+    # ForeignKey target needs a fully-qualified name when schema is set, so
+    # that SQLAlchemy resolves the parent table reference correctly.
+    fk_target = (
+        f"{schema}.{prefix}sessions.session_id"
+        if schema
+        else f"{prefix}sessions.session_id"
+    )
 
     sessions = sqlalchemy.Table(
         f"{prefix}sessions",
@@ -80,6 +92,7 @@ def _build_tables(
             "external_thread_key",
             name=f"uq_{prefix}sessions_natural_key",
         ),
+        schema=schema,
     )
 
     processed_messages = sqlalchemy.Table(
@@ -89,7 +102,7 @@ def _build_tables(
             "session_id",
             sqlalchemy.String(64),
             sqlalchemy.ForeignKey(
-                f"{prefix}sessions.session_id",
+                fk_target,
                 ondelete="CASCADE",
             ),
             nullable=False,
@@ -100,6 +113,7 @@ def _build_tables(
             nullable=False,
         ),
         sqlalchemy.PrimaryKeyConstraint("session_id", "message_id"),
+        schema=schema,
     )
 
     return sessions, processed_messages

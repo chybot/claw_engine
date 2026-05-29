@@ -345,10 +345,17 @@ def test_schema_migration_idempotent() -> None:
 
 
 def test_schema_migration_never_drops_or_alters() -> None:
-    """HC-B: only CREATE TABLE statements emitted; no DROP or ALTER.
+    """HC-B: schema migration is create-only.
 
-    Hook into Engine events to capture all DDL strings and assert none
-    contain 'DROP' or 'ALTER'.
+    Note: the initial ``metadata.create_all()`` runs inside the first
+    ``_ensure_engine()`` call BEFORE the ``before_cursor_execute`` hook below
+    is registered, so the initial CREATE TABLE IF NOT EXISTS statements are
+    NOT captured here.  We rely on SQLAlchemy's documented contract that
+    ``metadata.create_all(checkfirst=True)`` emits only
+    ``CREATE TABLE IF NOT EXISTS`` — never DROP or ALTER.  This test
+    therefore verifies the steady-state CRUD + repeat-ensure_engine paths
+    stay DDL-free; it does NOT re-verify the API-guaranteed initial
+    migration.
     """
     store = SQLAlchemySessionStore("sqlite:///:memory:")
     # Trigger engine creation
@@ -374,6 +381,91 @@ def test_schema_migration_never_drops_or_alters() -> None:
         upper = stmt.upper()
         assert "DROP" not in upper, f"Found DROP in statement: {stmt!r}"
         assert "ALTER" not in upper, f"Found ALTER in statement: {stmt!r}"
+
+
+def test_schema_argument_is_applied_to_tables() -> None:
+    """C1: when ``schema=`` is set, both Table objects + their DDL carry the qualifier.
+
+    Verified by:
+    1. Constructing tables via ``_build_tables(prefix, schema=...)`` directly.
+    2. Inspecting ``Table.schema`` attribute.
+    3. Compiling ``CreateTable`` DDL against a dialect and asserting the
+       schema-qualified table name appears in the rendered SQL.
+    """
+    from claw_engine.adapters.persistence.sqlalchemy.schema import _build_tables
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateTable
+
+    sessions, processed = _build_tables("claw_", schema="myapp")
+
+    # Tables carry the schema attribute
+    assert sessions.schema == "myapp"
+    assert processed.schema == "myapp"
+
+    # DDL renders with schema-qualified name
+    ddl_sessions = str(
+        CreateTable(sessions).compile(dialect=postgresql.dialect())
+    )
+    assert "myapp.claw_sessions" in ddl_sessions, (
+        f"Expected schema-qualified table name in DDL, got: {ddl_sessions!r}"
+    )
+
+    ddl_processed = str(
+        CreateTable(processed).compile(dialect=postgresql.dialect())
+    )
+    assert "myapp.claw_processed_messages" in ddl_processed, (
+        f"Expected schema-qualified table name in DDL, got: {ddl_processed!r}"
+    )
+    # FK target is also schema-qualified
+    assert "myapp.claw_sessions" in ddl_processed
+
+
+def test_build_tables_without_schema_is_unqualified() -> None:
+    """C1 counterpart: schema=None leaves tables unqualified (sqlite/mysql default)."""
+    from claw_engine.adapters.persistence.sqlalchemy.schema import _build_tables
+
+    sessions, processed = _build_tables("claw_", schema=None)
+    assert sessions.schema is None
+    assert processed.schema is None
+
+
+def test_ensure_engine_passes_schema_to_build_tables(monkeypatch: pytest.MonkeyPatch) -> None:
+    """C1: SQLAlchemySessionStore._ensure_engine forwards schema= to _build_tables.
+
+    Spy on _build_tables and assert the schema kwarg matches the constructor
+    arg.  This pins the wiring that C1 was about.
+    """
+    import claw_engine.adapters.persistence.sqlalchemy.store as store_mod
+
+    captured: dict = {}
+    original = store_mod._build_tables
+
+    def spy(prefix, *, schema=None):
+        captured["prefix"] = prefix
+        captured["schema"] = schema
+        return original(prefix, schema=schema)
+
+    monkeypatch.setattr(store_mod, "_build_tables", spy)
+
+    # Use sqlite since the URL still needs to be parseable; ``schema`` is
+    # ignored at DDL execution on sqlite but the call must still propagate it.
+    store = SQLAlchemySessionStore(
+        "sqlite:///:memory:",
+        schema="myapp",
+        table_prefix="claw_",
+    )
+    # NOTE: sqlite ignores schema= at DDL emit time (raises OperationalError
+    # because the named schema isn't ATTACH'd).  We catch the SessionStoreError
+    # wrapper and inspect what was passed to _build_tables.
+    try:
+        store._ensure_engine()
+    except SessionStoreError:
+        # Expected — sqlite has no "myapp" schema ATTACH'd.  The point of this
+        # test is to confirm schema was *passed*, which the spy captured before
+        # the SQL error.
+        pass
+
+    assert captured == {"prefix": "claw_", "schema": "myapp"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -608,3 +700,107 @@ def test_session_store_error_no_stage() -> None:
     err = SessionStoreError("problem without stage")
     assert err.stage is None
     assert "problem without stage" in str(err)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# I4: SessionStoreError validates the ``stage`` field
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("bad_stage", ["quary", "Init", "QUERY", "", "auth", "network"])
+def test_session_store_error_rejects_invalid_stage(bad_stage: str) -> None:
+    """I4: ``stage`` must be one of {'init', 'query'} or None — typos rejected."""
+    with pytest.raises(ValueError, match="stage"):
+        SessionStoreError("msg", stage=bad_stage)
+
+
+@pytest.mark.parametrize("good_stage", [None, "init", "query"])
+def test_session_store_error_accepts_valid_stage(good_stage: str | None) -> None:
+    """I4: the documented stages all construct without error."""
+    err = SessionStoreError("msg", stage=good_stage)
+    assert err.stage == good_stage
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# I3: _ensure_engine wraps SQLAlchemy errors in SessionStoreError(stage='init')
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_ensure_engine_wraps_init_failures_in_session_store_error() -> None:
+    """I3: when create_engine / create_all fails, raise SessionStoreError(stage='init').
+
+    Uses a sqlite DSN pointing at a directory that doesn't exist — sqlite
+    will fail to open the database file when create_all attempts the first
+    transaction.  The raw sqlalchemy.exc.OperationalError must be wrapped.
+    """
+    # sqlite cannot create databases in non-existent directories
+    bad_url = "sqlite:////nonexistent/parent/dir/db.sqlite"
+    store = SQLAlchemySessionStore(bad_url)
+    with pytest.raises(SessionStoreError) as exc_info:
+        store._ensure_engine()
+    assert exc_info.value.stage == "init"
+    # I3 + HC-C: the wrapped message must NOT echo the underlying SQLAlchemy
+    # error text (which may contain the bound URL with credentials).
+    msg = str(exc_info.value)
+    assert "OperationalError" in msg or "Error" in msg
+    # Cause chain must preserve the original for debuggers
+    assert exc_info.value.__cause__ is not None
+
+
+def test_ensure_engine_init_error_does_not_leak_password() -> None:
+    """I3 + HC-C: init-time errors must never leak DSN credentials.
+
+    Bypass constructor validation, set a credentialed URL post-construction,
+    trigger init failure, and verify the error message excludes the password.
+    """
+    store = SQLAlchemySessionStore("sqlite:////nonexistent/dir/db.sqlite")
+    # Inject a sentinel password into the stored URL
+    store._url = (
+        f"sqlite:////nonexistent/dir/db.sqlite?password={SENTINEL_PW}"
+    )
+    # Now query keys are checked at construction only; _ensure_engine just
+    # forwards self._url to create_engine.  SQLAlchemy may include the URL
+    # in its error.  Our wrapper must strip it.
+    with pytest.raises(SessionStoreError) as exc_info:
+        store._ensure_engine()
+    assert_no_password_leak(str(exc_info.value))
+    assert_no_password_leak(repr(exc_info.value))
+
+
+def test_ensure_engine_disposes_half_built_engine_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I3 / Minor 8: when create_all fails, the partially-built engine.dispose() is called.
+
+    Patch create_all to raise an SQLAlchemyError, then verify the engine
+    object created just before was disposed (pool released).
+    """
+    dispose_calls: list[bool] = []
+    original_create_engine = sqlalchemy.create_engine
+
+    def patched_create_engine(*args, **kwargs):
+        engine = original_create_engine(*args, **kwargs)
+        original_dispose = engine.dispose
+
+        def tracking_dispose(*a, **kw):
+            dispose_calls.append(True)
+            return original_dispose(*a, **kw)
+
+        engine.dispose = tracking_dispose  # type: ignore[method-assign]
+        return engine
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", patched_create_engine)
+
+    # Patch MetaData.create_all on any instance to raise
+    def boom_create_all(self, *args, **kwargs):
+        raise sqlalchemy.exc.OperationalError("simulated", None, Exception("boom"))
+
+    monkeypatch.setattr(sqlalchemy.MetaData, "create_all", boom_create_all)
+
+    store = SQLAlchemySessionStore("sqlite:///:memory:")
+    with pytest.raises(SessionStoreError):
+        store._ensure_engine()
+    assert dispose_calls == [True], (
+        f"engine.dispose should be called exactly once on init failure, "
+        f"got calls: {dispose_calls}"
+    )

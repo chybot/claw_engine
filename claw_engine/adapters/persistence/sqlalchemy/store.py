@@ -12,135 +12,19 @@ HC-D: Session round-trip byte-identical across sqlite / mysql / postgres.
 """
 from __future__ import annotations
 
-import re
 import threading
 import uuid
-from typing import Optional
 
 import sqlalchemy
 import sqlalchemy.engine.url as sa_url
 
-from claw_engine.engine.persistence.contracts import Session
 from claw_engine.adapters.persistence.sqlalchemy.errors import SessionStoreError
 from claw_engine.adapters.persistence.sqlalchemy.schema import _build_tables
-
-# ── Allowed URL schemes ───────────────────────────────────────────────────────
-
-_ALLOWED_SCHEMES = frozenset(
-    {
-        "sqlite",
-        "mysql",
-        "mysql+pymysql",
-        "postgresql",
-        "postgresql+psycopg",
-        # also accept "postgres" alias that SQLAlchemy normalises
-        "postgres",
-    }
+from claw_engine.adapters.persistence.sqlalchemy.validation import (
+    _validate_construction_args,
+    _validate_field,
 )
-
-# ── Locked DSN query allowlist (sub-plan §2) ─────────────────────────────────
-
-_ALLOWED_DSN_QUERY_KEYS = frozenset(
-    {
-        # universal
-        "connect_timeout",
-        "charset",
-        # postgres
-        "sslmode",
-        "sslrootcert",
-        "sslcert",
-        "sslkey",
-        "application_name",
-        # mysql / pymysql
-        "ssl_ca",
-        "ssl_cert",
-        "ssl_key",
-        "ssl_verify_cert",
-        "ssl_verify_identity",
-    }
-)
-
-# ── table_prefix validation ───────────────────────────────────────────────────
-
-_TABLE_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_TABLE_PREFIX_MAX = 32
-
-# ── schema name validation ────────────────────────────────────────────────────
-
-_SCHEMA_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]+$")
-_SQL_KEYWORDS = frozenset(
-    {
-        "select",
-        "from",
-        "where",
-        "insert",
-        "update",
-        "delete",
-        "drop",
-        "alter",
-        "create",
-        "table",
-        "index",
-        "into",
-        "values",
-        "set",
-        "join",
-        "on",
-        "order",
-        "group",
-        "by",
-        "having",
-        "union",
-        "all",
-        "distinct",
-        "as",
-        "null",
-        "not",
-        "and",
-        "or",
-        "in",
-        "is",
-        "like",
-        "between",
-        "case",
-        "when",
-        "then",
-        "else",
-        "end",
-    }
-)
-
-# ── Adapter-boundary field length caps (sub-plan §7, matches §5 schema) ──────
-
-_FIELD_CAPS: dict[str, int] = {
-    "workspace_id": 128,
-    "channel": 64,
-    "external_thread_key": 256,
-    "backend_name": 64,
-    "session_id": 64,
-    "backend_thread_id": 256,
-    "message_id": 256,
-}
-
-
-def _validate_field(name: str, value: Optional[str], *, nullable: bool = False) -> None:
-    """Validate a string field: non-empty check and length cap.
-
-    No regex — SQLAlchemy parameterized queries prevent SQL injection;
-    regex on workspace_id/channel would wrongly reject legitimate thread keys
-    like "slack:T01ABC#general/thread/123".
-    """
-    if value is None:
-        if not nullable:
-            raise ValueError(f"{name} must not be None")
-        return
-    if not value:
-        raise ValueError(f"{name} must not be empty")
-    cap = _FIELD_CAPS.get(name)
-    if cap is not None and len(value) > cap:
-        raise ValueError(
-            f"{name} exceeds maximum length {cap} (got {len(value)})"
-        )
+from claw_engine.engine.persistence.contracts import Session
 
 
 class SQLAlchemySessionStore:
@@ -164,8 +48,8 @@ class SQLAlchemySessionStore:
             url: SQLAlchemy DSN — sqlite:///…, mysql+pymysql://…, postgresql+psycopg://….
                  Credentials MUST NOT be embedded (HC-C).  Use env-vars consumed
                  by the driver or wrap through SecretProvider.
-            schema: Postgres schema name.  None → default search_path.
-                    Ignored for sqlite and mysql.
+            schema: Postgres schema name to qualify both tables.  None → default
+                    search_path.  Ignored by sqlite and mysql at the DDL level.
             table_prefix: Prefix for both table names.  Default "claw_".
                           Empty string allowed; max 32 chars.
 
@@ -174,63 +58,7 @@ class SQLAlchemySessionStore:
                         table_prefix, schema).
         """
         # ── Validate ALL inputs before storing any self._x (P8d HC-A lesson) ──
-
-        if not url:
-            raise ValueError("url must not be empty")
-
-        # Parse DSN (pure-string, no connection attempted)
-        try:
-            parsed = sa_url.make_url(url)
-        except Exception as exc:
-            raise ValueError(f"url is not a valid SQLAlchemy DSN: {exc}") from None
-
-        # Scheme check
-        scheme = (parsed.drivername or "").lower()
-        if scheme not in _ALLOWED_SCHEMES:
-            raise ValueError(
-                f"url scheme {scheme!r} is not supported. "
-                f"Allowed: sqlite, mysql, mysql+pymysql, postgresql, postgresql+psycopg."
-            )
-
-        # Credential check (HC-C) — reject username or password in DSN
-        if parsed.username or parsed.password:
-            raise ValueError(
-                "url must not contain embedded credentials (username / password). "
-                "Use driver-level env vars or a SecretProvider instead."
-            )
-
-        # Query key allowlist check
-        if parsed.query:
-            for key in parsed.query:
-                if key not in _ALLOWED_DSN_QUERY_KEYS:
-                    raise ValueError(
-                        f"url query key {key!r} is not in the allowed list. "
-                        f"Allowed keys: {sorted(_ALLOWED_DSN_QUERY_KEYS)}."
-                    )
-
-        # table_prefix validation (interpolated into DDL — strict regex needed)
-        if table_prefix != "" and not _TABLE_PREFIX_RE.match(table_prefix):
-            raise ValueError(
-                f"table_prefix {table_prefix!r} is invalid. "
-                "Must match [A-Za-z_][A-Za-z0-9_]* or be empty string."
-            )
-        if len(table_prefix) > _TABLE_PREFIX_MAX:
-            raise ValueError(
-                f"table_prefix exceeds maximum length {_TABLE_PREFIX_MAX} "
-                f"(got {len(table_prefix)})"
-            )
-
-        # schema validation
-        if schema is not None:
-            if not _SCHEMA_NAME_RE.match(schema):
-                raise ValueError(
-                    f"schema {schema!r} is invalid. "
-                    "Must match [A-Za-z_][A-Za-z0-9_]+ (at least 2 chars)."
-                )
-            if schema.lower() in _SQL_KEYWORDS:
-                raise ValueError(
-                    f"schema {schema!r} is a reserved SQL keyword."
-                )
+        _validate_construction_args(url, schema, table_prefix)
 
         # ── All validated — now store ──────────────────────────────────────────
         self._url = url
@@ -250,6 +78,13 @@ class SQLAlchemySessionStore:
 
         Double-checked locking prevents two threads racing into double-create.
         Once the engine exists, the lock is NOT held on reads.
+
+        Raises:
+            SessionStoreError(stage='init'): when create_engine or
+                metadata.create_all fail.  Message intentionally omits the
+                underlying exception text since SQLAlchemy errors can echo
+                the bound URL (HC-C); inspect ``__cause__`` for the full
+                detail when debugging.
         """
         if self._engine is not None:
             return self._engine
@@ -259,21 +94,46 @@ class SQLAlchemySessionStore:
             if self._engine is not None:
                 return self._engine
 
-            engine = sqlalchemy.create_engine(self._url)
-            sessions, processed = _build_tables(self._table_prefix)
+            engine: sqlalchemy.engine.Engine | None = None
+            try:
+                engine = sqlalchemy.create_engine(self._url)
+                sessions, processed = _build_tables(
+                    self._table_prefix, schema=self._schema
+                )
+                # HC-B: CREATE TABLE IF NOT EXISTS for both tables.
+                # metadata.create_all with checkfirst=True is documented to
+                # emit only CREATE TABLE IF NOT EXISTS — never DROP / ALTER.
+                sessions.metadata.create_all(engine, checkfirst=True)
+            except sqlalchemy.exc.SQLAlchemyError as exc:
+                # Release any pool resources from the half-built engine.
+                if engine is not None:
+                    try:
+                        engine.dispose()
+                    except Exception:
+                        pass
+                # HC-C: do NOT include str(exc) — SQLAlchemy can embed the
+                # bound URL with credentials in its error messages.
+                raise SessionStoreError(
+                    "failed to initialize engine or create schema: "
+                    f"{exc.__class__.__name__}",
+                    stage="init",
+                ) from exc
 
-            # HC-B: CREATE TABLE IF NOT EXISTS for both tables.
-            # metadata.create_all with checkfirst=True emits CREATE TABLE IF NOT EXISTS.
-            # Never DROP, never ALTER.
-            metadata = sessions.metadata
-            metadata.create_all(engine, checkfirst=True)
-
-            # Store atomically (last line before returning)
+            # Store atomically (last assignments before returning)
             self._sessions = sessions
             self._processed = processed
             self._engine = engine
 
         return self._engine
+
+    def _engine_and_tables(
+        self,
+    ) -> tuple[sqlalchemy.engine.Engine, sqlalchemy.Table, sqlalchemy.Table]:
+        """Return (engine, sessions_table, processed_table), ensuring init."""
+        engine = self._ensure_engine()
+        assert self._sessions is not None  # set by _ensure_engine
+        assert self._processed is not None
+        return engine, self._sessions, self._processed
 
     # ── Protocol methods ──────────────────────────────────────────────────────
 
@@ -296,9 +156,7 @@ class SQLAlchemySessionStore:
         _validate_field("external_thread_key", external_thread_key)
         _validate_field("backend_name", backend_name)
 
-        engine = self._ensure_engine()
-        sessions = self._sessions
-        assert sessions is not None  # set by _ensure_engine
+        engine, sessions, _ = self._engine_and_tables()
 
         def _select_by_natural_key(conn: object) -> object:
             return conn.execute(  # type: ignore[union-attr]
@@ -368,9 +226,7 @@ class SQLAlchemySessionStore:
                 "backend_thread_id", session.backend_thread_id, nullable=True
             )
 
-        engine = self._ensure_engine()
-        sessions = self._sessions
-        assert sessions is not None
+        engine, sessions, _ = self._engine_and_tables()
 
         with engine.begin() as conn:
             conn.execute(
@@ -389,9 +245,7 @@ class SQLAlchemySessionStore:
         _validate_field("session_id", session_id)
         _validate_field("message_id", message_id)
 
-        engine = self._ensure_engine()
-        processed = self._processed
-        assert processed is not None
+        engine, _, processed = self._engine_and_tables()
 
         with engine.connect() as conn:
             row = conn.execute(
@@ -411,9 +265,7 @@ class SQLAlchemySessionStore:
         _validate_field("session_id", session_id)
         _validate_field("message_id", message_id)
 
-        engine = self._ensure_engine()
-        processed = self._processed
-        assert processed is not None
+        engine, _, processed = self._engine_and_tables()
 
         with engine.begin() as conn:
             try:
