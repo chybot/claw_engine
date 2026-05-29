@@ -150,6 +150,14 @@ class SQLAlchemySessionStore:
 
         Lookup is by natural key (workspace_id, channel, external_thread_key).
         If a session exists, it is returned unchanged (existing fields win).
+
+        Concurrency: on PostgreSQL, any IntegrityError raised mid-transaction
+        puts that transaction in an ABORTED state where all subsequent
+        statements fail until rollback.  We therefore catch IntegrityError
+        OUTSIDE the ``with engine.begin()`` block — the context manager's
+        __exit__ rolls back the failed transaction cleanly, and the re-fetch
+        runs in a fresh transaction.  Do NOT collapse this back into a
+        single transaction — see P1-#2 in the P8e review.
         """
         _validate_field("workspace_id", workspace_id)
         _validate_field("channel", channel)
@@ -158,29 +166,32 @@ class SQLAlchemySessionStore:
 
         engine, sessions, _ = self._engine_and_tables()
 
-        def _select_by_natural_key(conn: object) -> object:
-            return conn.execute(  # type: ignore[union-attr]
-                sqlalchemy.select(sessions).where(
-                    sessions.c.workspace_id == workspace_id,
-                    sessions.c.channel == channel,
-                    sessions.c.external_thread_key == external_thread_key,
-                )
-            ).one_or_none()
+        select_stmt = sqlalchemy.select(sessions).where(
+            sessions.c.workspace_id == workspace_id,
+            sessions.c.channel == channel,
+            sessions.c.external_thread_key == external_thread_key,
+        )
 
+        # Phase 1: existence check in its own transaction.
         with engine.begin() as conn:
-            row = _select_by_natural_key(conn)
-            if row is not None:
-                return self._row_to_session(row)
+            row = conn.execute(select_stmt).one_or_none()
+        if row is not None:
+            return self._row_to_session(row)
 
-            session = Session(
-                session_id=uuid.uuid4().hex,
-                workspace_id=workspace_id,
-                channel=channel,
-                external_thread_key=external_thread_key,
-                backend_name=backend_name,
-                max_rounds=max_rounds,
-            )
-            try:
+        # Phase 2: attempt insert in a SEPARATE transaction.  IntegrityError
+        # (UNIQUE constraint violation from a concurrent inserter) is caught
+        # OUTSIDE the ``with`` so the failed Postgres transaction is fully
+        # rolled back before any follow-up SELECT.
+        session = Session(
+            session_id=uuid.uuid4().hex,
+            workspace_id=workspace_id,
+            channel=channel,
+            external_thread_key=external_thread_key,
+            backend_name=backend_name,
+            max_rounds=max_rounds,
+        )
+        try:
+            with engine.begin() as conn:
                 conn.execute(
                     sqlalchemy.insert(sessions).values(
                         session_id=session.session_id,
@@ -194,24 +205,23 @@ class SQLAlchemySessionStore:
                         last_active=session.last_active,
                     )
                 )
-                return session
-            except sqlalchemy.exc.IntegrityError:
-                # Concurrent insert race: another thread inserted the same
-                # natural key between our SELECT and INSERT.  Transaction
-                # will be rolled back when this `with` block exits; we
-                # re-fetch the winner's row in a fresh transaction below.
-                pass
+            return session
+        except sqlalchemy.exc.IntegrityError:
+            # Concurrent inserter beat us to the natural key.  The Postgres
+            # txn above was aborted and is now rolled back by the context
+            # manager.  Phase 3 below runs in a fresh transaction.
+            pass
 
-        # Concurrent INSERT lost the race — fetch the winner's row.
+        # Phase 3: re-fetch the winner's row in a fresh transaction.
         with engine.begin() as conn:
-            row = _select_by_natural_key(conn)
-            if row is not None:
-                return self._row_to_session(row)
-            # Should never reach here — a row was inserted by another thread.
-            raise SessionStoreError(
-                "get_or_create: session not found after concurrent insert",
-                stage="query",
-            )
+            row = conn.execute(select_stmt).one_or_none()
+        if row is not None:
+            return self._row_to_session(row)
+        # Should never reach here — a row was inserted by another thread.
+        raise SessionStoreError(
+            "get_or_create: session not found after concurrent insert",
+            stage="query",
+        )
 
     def save(self, session: Session) -> None:
         """Persist updates to an existing session.
@@ -261,23 +271,31 @@ class SQLAlchemySessionStore:
 
         Calling twice does not error (INSERT OR IGNORE semantics via
         try/except on IntegrityError).
+
+        Concurrency: IntegrityError is caught OUTSIDE ``with engine.begin()``
+        — on PostgreSQL an in-transaction IntegrityError aborts the txn so
+        that the context manager's COMMIT becomes a no-op (effectively a
+        ROLLBACK).  Catching inside would leak the aborted state to any
+        subsequent statement on the same connection.  See P1-#2 in the P8e
+        review; do NOT collapse this back into a single ``with`` block.
         """
         _validate_field("session_id", session_id)
         _validate_field("message_id", message_id)
 
         engine, _, processed = self._engine_and_tables()
 
-        with engine.begin() as conn:
-            try:
+        try:
+            with engine.begin() as conn:
                 conn.execute(
                     sqlalchemy.insert(processed).values(
                         session_id=session_id,
                         message_id=message_id,
                     )
                 )
-            except sqlalchemy.exc.IntegrityError:
-                # Already exists — idempotent, swallow the duplicate key error.
-                pass
+        except sqlalchemy.exc.IntegrityError:
+            # Already exists — idempotent.  Postgres txn is rolled back by
+            # the context manager; we simply return success.
+            pass
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

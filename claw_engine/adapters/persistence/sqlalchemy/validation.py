@@ -14,17 +14,17 @@ import sqlalchemy.engine.url as sa_url
 
 # ── Allowed DSN URL schemes ──────────────────────────────────────────────────
 
-# Note: "postgres" is intentionally accepted as an alias for "postgresql".
-# SQLAlchemy itself emits a deprecation warning but still parses it; we accept
-# it so callers migrating from older DSNs aren't broken at the adapter layer.
+# Only driver-explicit schemes that match the shipped optional extras.
+# Bare aliases like "mysql://" / "postgresql://" / "postgres://" are rejected
+# because SQLAlchemy 2.x dispatches them to default drivers (MySQLdb / psycopg2)
+# that we do NOT ship in [persistence-mysql] / [persistence-postgres] — that
+# would produce an opaque ImportError at first DB call.  Force callers to
+# pick the +driver form so the failure mode is clear at construction time.
 _ALLOWED_SCHEMES: frozenset[str] = frozenset(
     {
-        "sqlite",
-        "mysql",
-        "mysql+pymysql",
-        "postgresql",
-        "postgresql+psycopg",
-        "postgres",  # alias for postgresql
+        "sqlite",                # stdlib sqlite3, no extra driver needed
+        "mysql+pymysql",         # matches [persistence-mysql] (pymysql>=1.1)
+        "postgresql+psycopg",    # matches [persistence-postgres] (psycopg[binary]>=3.1)
     }
 )
 
@@ -144,12 +144,17 @@ def _validate_construction_args(
             f"url is not a valid SQLAlchemy DSN: {exc.__class__.__name__}"
         ) from None
 
-    # Scheme check
+    # Scheme check — strict allowlist, +driver form required for mysql/postgres
     scheme = (parsed.drivername or "").lower()
     if scheme not in _ALLOWED_SCHEMES:
         raise ValueError(
             f"url scheme {scheme!r} is not supported. "
-            f"Allowed: sqlite, mysql, mysql+pymysql, postgresql, postgresql+psycopg."
+            f"Allowed: {sorted(_ALLOWED_SCHEMES)}. "
+            f"For mysql, use 'mysql+pymysql://...'; for postgres, use "
+            f"'postgresql+psycopg://...'. The bare 'mysql://', 'postgresql://', "
+            f"and 'postgres://' aliases pick default drivers (MySQLdb / psycopg2) "
+            f"that are NOT shipped via the [persistence-mysql] / "
+            f"[persistence-postgres] extras."
         )
 
     # Credential check (HC-C) — reject username or password in DSN.

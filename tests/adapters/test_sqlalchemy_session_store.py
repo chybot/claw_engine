@@ -91,19 +91,43 @@ def test_construction_validates_url_scheme() -> None:
             SQLAlchemySessionStore(bad_url)
 
 
-def test_construction_accepts_supported_schemes() -> None:
-    """HC-A: sqlite, mysql, mysql+pymysql, postgresql, postgresql+psycopg all accepted."""
-    good_urls = [
+@pytest.mark.parametrize(
+    "url",
+    [
         "sqlite:///test.db",
         "sqlite:///:memory:",
-        "mysql://host/db",
         "mysql+pymysql://host/db",
-        "postgresql://host/db",
         "postgresql+psycopg://host/db",
-    ]
-    for url in good_urls:
-        store = SQLAlchemySessionStore(url)
-        assert store is not None
+    ],
+)
+def test_construction_accepts_explicit_driver_form(url: str) -> None:
+    """P1-#1: Only +driver forms matching shipped extras are accepted."""
+    store = SQLAlchemySessionStore(url)
+    assert store is not None
+
+
+# ── P1-#1: Bare scheme aliases must be rejected ──────────────────────────────
+
+
+def test_construction_rejects_bare_mysql_scheme() -> None:
+    """P1-#1: bare 'mysql://' picks MySQLdb (not shipped) → reject at construct."""
+    with pytest.raises(ValueError, match="mysql\\+pymysql") as exc_info:
+        SQLAlchemySessionStore("mysql://host/db")
+    # Error must guide to the correct form
+    assert "mysql+pymysql" in str(exc_info.value)
+
+
+def test_construction_rejects_bare_postgresql_scheme() -> None:
+    """P1-#1: bare 'postgresql://' picks psycopg2 (not shipped) → reject at construct."""
+    with pytest.raises(ValueError, match="postgresql\\+psycopg") as exc_info:
+        SQLAlchemySessionStore("postgresql://host/db")
+    assert "postgresql+psycopg" in str(exc_info.value)
+
+
+def test_construction_rejects_postgres_alias() -> None:
+    """P1-#1: deprecated 'postgres://' alias is rejected."""
+    with pytest.raises(ValueError, match="scheme"):
+        SQLAlchemySessionStore("postgres://host/db")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -114,9 +138,9 @@ def test_construction_accepts_supported_schemes() -> None:
 def test_construction_rejects_url_with_credentials() -> None:
     """HC-C: DSN with embedded user:pass raises ValueError."""
     bad_urls = [
-        f"postgresql://user:{SENTINEL_PW}@host/db",
+        f"postgresql+psycopg://user:{SENTINEL_PW}@host/db",
         "mysql+pymysql://admin:secret@host/mydb",
-        "postgresql://user@host/db",
+        "postgresql+psycopg://user@host/db",
     ]
     for bad_url in bad_urls:
         with pytest.raises(ValueError):
@@ -125,7 +149,7 @@ def test_construction_rejects_url_with_credentials() -> None:
 
 def test_construction_rejection_message_does_not_leak_password() -> None:
     """HC-C: the ValueError message from credential rejection must not echo the password."""
-    bad_url = f"postgresql://user:{SENTINEL_PW}@host/db"
+    bad_url = f"postgresql+psycopg://user:{SENTINEL_PW}@host/db"
     with pytest.raises(ValueError) as exc_info:
         SQLAlchemySessionStore(bad_url)
     error_text = str(exc_info.value)
@@ -141,7 +165,7 @@ def test_repr_does_not_leak_url_password() -> None:
     """
     store = SQLAlchemySessionStore("sqlite:///:memory:")
     # Bypass validation by directly mutating
-    store._url = f"postgresql://user:{SENTINEL_PW}@host/db"
+    store._url = f"postgresql+psycopg://user:{SENTINEL_PW}@host/db"
 
     repr_text = repr(store)
     str_text = str(store)
@@ -157,7 +181,7 @@ def test_repr_does_not_leak_url_password() -> None:
 )
 def test_construction_rejects_url_with_unknown_query(bad_key: str) -> None:
     """HC-C: DSN with query param not in allowlist raises ValueError."""
-    bad_url = f"postgresql://host/db?{bad_key}=value"
+    bad_url = f"postgresql+psycopg://host/db?{bad_key}=value"
     with pytest.raises(ValueError, match="query key"):
         SQLAlchemySessionStore(bad_url)
 
@@ -181,7 +205,7 @@ def test_construction_rejects_url_with_unknown_query(bad_key: str) -> None:
 )
 def test_construction_accepts_allowed_query_keys(good_key: str) -> None:
     """HC-C: all 12 allowlist query keys are accepted."""
-    url = f"postgresql://host/db?{good_key}=value"
+    url = f"postgresql+psycopg://host/db?{good_key}=value"
     store = SQLAlchemySessionStore(url)
     assert store is not None
 
@@ -565,6 +589,125 @@ def test_mark_processed_idempotent() -> None:
     store.mark_processed(s.session_id, "msg-1")
     store.mark_processed(s.session_id, "msg-1")  # should not error
     assert store.is_processed(s.session_id, "msg-1")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# P1-#2: IntegrityError must propagate OUT of engine.begin() before being caught
+# (regression for Postgres aborted-transaction state).  SQLite forgives this
+# pattern, but Postgres does not — the tests below exercise the post-error
+# follow-up path that proves no aborted-state leakage.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_mark_processed_twice_then_subsequent_ops_work() -> None:
+    """P1-#2 regression: after a duplicate mark_processed, subsequent ops succeed.
+
+    If IntegrityError were caught INSIDE ``with engine.begin()``, on Postgres
+    the next operation on the same connection would fail with "current
+    transaction is aborted, commands ignored".  This test pins the structural
+    fix that the catch is OUTSIDE the ``with``.
+    """
+    store = make_sqlite_store()
+    s = store.get_or_create(**_KW)
+    store.mark_processed(s.session_id, "msg-1")
+    store.mark_processed(s.session_id, "msg-1")  # duplicate (IntegrityError path)
+    # Both reads + writes after the duplicate must work cleanly
+    assert store.is_processed(s.session_id, "msg-1") is True
+    store.mark_processed(s.session_id, "msg-2")
+    assert store.is_processed(s.session_id, "msg-2") is True
+    # And we can keep doing duplicates without stuck state
+    store.mark_processed(s.session_id, "msg-2")
+    assert store.is_processed(s.session_id, "msg-2") is True
+
+
+def test_concurrent_get_or_create_returns_same_session_id_under_race() -> None:
+    """P1-#2 regression: under a real INSERT race, both threads return the same id.
+
+    Forces the IntegrityError re-fetch path inside get_or_create.  If the
+    catch were inside ``with engine.begin()`` on Postgres, the re-fetch
+    SELECT would run inside the aborted transaction and either error or
+    return stale data, causing the two threads to disagree.
+    """
+    import time
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+
+    try:
+        store = SQLAlchemySessionStore(f"sqlite:///{db_path}")
+        # Pre-warm the engine so the lock-contention is on INSERT, not init
+        store._ensure_engine()
+
+        barrier = threading.Barrier(2)
+        results: list[str] = []
+        errors: list[Exception] = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            try:
+                barrier.wait()
+                # Tiny stagger to widen the race
+                time.sleep(0.001)
+                s = store.get_or_create(**_KW)
+                with lock:
+                    results.append(s.session_id)
+            except Exception as e:
+                with lock:
+                    errors.append(e)
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert not errors, f"Thread errors: {errors}"
+        assert len(results) == 2
+        # Both threads must observe the same winner — proves the re-fetch
+        # in get_or_create ran cleanly after the IntegrityError path.
+        assert results[0] == results[1], (
+            f"Concurrent get_or_create returned different session_ids: {results}"
+        )
+    finally:
+        os.unlink(db_path)
+
+
+def test_integrity_error_catch_is_outside_engine_begin_block() -> None:
+    """P1-#2 structural pin: source-level check that the catch is OUT of with-block.
+
+    Inspects the source of get_or_create and mark_processed to assert that no
+    ``except sqlalchemy.exc.IntegrityError`` appears within an ``engine.begin()``
+    context.  This is the strongest guard against a future maintainer
+    "simplifying" the pattern back into the buggy nested form.
+    """
+    import inspect
+    from claw_engine.adapters.persistence.sqlalchemy.store import (
+        SQLAlchemySessionStore as _S,
+    )
+
+    for method_name in ("get_or_create", "mark_processed"):
+        src = inspect.getsource(getattr(_S, method_name))
+        # Pop-stack walk: track the indentation of any active ``with engine.begin``.
+        # An ``except .*IntegrityError`` at deeper indent than such a ``with``
+        # before that ``with`` block has been left signals the buggy pattern.
+        in_with_begin: list[int] = []  # stack of indent levels
+        for line in src.splitlines():
+            stripped = line.lstrip()
+            indent = len(line) - len(stripped)
+            # Pop any with-begin blocks whose body has ended
+            while in_with_begin and indent <= in_with_begin[-1]:
+                in_with_begin.pop()
+            if "with " in stripped and "engine.begin()" in stripped:
+                in_with_begin.append(indent)
+                continue
+            if "except" in stripped and "IntegrityError" in stripped:
+                assert not in_with_begin, (
+                    f"P1-#2 regression: ``except IntegrityError`` is inside an "
+                    f"active ``with engine.begin()`` block in {method_name!r}. "
+                    f"This causes Postgres aborted-transaction failures.\n"
+                    f"Offending line: {line!r}"
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
