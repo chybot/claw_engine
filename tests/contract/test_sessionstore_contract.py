@@ -23,8 +23,10 @@ helper's contract exactly.
 Helper file (tests/contract/sessionstore_contract.py) is UNCHANGED.
 
 Fixture scoping note: postgres_url and unique_table_prefix live in
-tests/integration/conftest.py and are re-exported via tests/conftest.py
-(pytest_plugins = ["tests.integration.conftest"]), making them available here.
+tests/conftest.py (the top-level conftest — see that file's docstring for
+the rationale why a peer pytest_plugins re-export was rejected). pytest
+auto-discovers top-level conftest fixtures across all subpackages, so they
+are directly available here.
 """
 from __future__ import annotations
 
@@ -95,9 +97,12 @@ def make_store(request: pytest.FixtureRequest, tmp_path: object) -> object:
         return lambda: store
 
     if backend == "sqlalchemy-postgres":
-        # postgres_url and unique_table_prefix are function-scoped fixtures from
-        # tests/integration/conftest.py (available here via tests/conftest.py
-        # pytest_plugins re-export).
+        # postgres_url and unique_table_prefix are function-scoped fixtures
+        # defined in tests/conftest.py (the top-level conftest — see that file's
+        # docstring for why a peer pytest_plugins re-export from
+        # tests/integration/conftest.py was rejected). pytest auto-discovers
+        # top-level conftest fixtures across all subpackages, so they are
+        # directly resolvable via request.getfixturevalue() here.
         url: str = request.getfixturevalue("postgres_url")
         prefix: str = request.getfixturevalue("unique_table_prefix")
         store = SQLAlchemySessionStore(url, table_prefix=prefix)

@@ -123,6 +123,12 @@ def test_concurrent_get_or_create_deterministically_triggers_integrity_error_on_
     )
 
     insert_barrier = threading.Barrier(2, timeout=10)
+    # Counter to prove the race actually occurred. If a future refactor renames
+    # store._engine or otherwise breaks the hook registration, this counter would
+    # stay at 0 — and the post-race assertion below would fail loudly rather
+    # than silently green-lighting a degenerate test.
+    fire_lock = threading.Lock()
+    fire_count = [0]
 
     @sqlalchemy.event.listens_for(store._engine, "before_cursor_execute")
     def block_inserts_until_both_arrive(
@@ -139,6 +145,8 @@ def test_concurrent_get_or_create_deterministically_triggers_integrity_error_on_
             statement.lstrip().upper().startswith("INSERT INTO")
             and sessions_table in statement
         ):
+            with fire_lock:
+                fire_count[0] += 1
             insert_barrier.wait()
 
     natural_key = dict(
@@ -173,6 +181,20 @@ def test_concurrent_get_or_create_deterministically_triggers_integrity_error_on_
         sqlalchemy.event.remove(
             store._engine, "before_cursor_execute", block_inserts_until_both_arrive
         )
+
+    # KILLER-TEST SENTINEL: prove the deterministic race actually occurred.
+    # If store._engine ever gets renamed/moved by a refactor, the @event hook
+    # would silently register on the wrong object (or fail outright). Without
+    # this assertion, threads serialise naturally, errors == [None, None]
+    # passes, and the test goes silently green while the bug it guards against
+    # is never exercised. fire_count >= 2 means both racers' INSERT statements
+    # hit the hook (each thread's session-table INSERT increments once).
+    assert fire_count[0] >= 2, (
+        f"Race hook fired only {fire_count[0]} times — expected >= 2. "
+        f"The deterministic race did NOT occur (both threads serialised or "
+        f"the hook missed entirely). Check that store._engine refers to the "
+        f"same Engine instance that get_or_create uses."
+    )
 
     # Both threads completed without escaping exception
     assert errors == [None, None], f"unexpected exceptions: {errors}"
@@ -276,35 +298,41 @@ def test_postgres_schema_argument_creates_tables_in_schema(
     """Verify P8e C1 fix on real Postgres: schema= actually puts tables in that schema."""
     schema_name = f"claw_test_{uuid.uuid4().hex[:6]}"
 
-    # Create the schema first (testcontainers gives us 'test' user with CREATEDB;
-    # CREATE SCHEMA is allowed).
-    with sqlalchemy.create_engine(postgres_url).begin() as conn:
-        conn.execute(sqlalchemy.text(f"CREATE SCHEMA {schema_name}"))
+    # Single raw engine for both DDL and verification — explicit dispose() in
+    # finally prevents pool leaks across repeated test runs.
+    raw_engine = sqlalchemy.create_engine(postgres_url)
+    try:
+        # Create the schema first (testcontainers gives us 'test' user with CREATEDB;
+        # CREATE SCHEMA is allowed).
+        with raw_engine.begin() as conn:
+            conn.execute(sqlalchemy.text(f"CREATE SCHEMA {schema_name}"))
 
-    store = SQLAlchemySessionStore(
-        postgres_url,
-        schema=schema_name,
-        table_prefix=unique_table_prefix,
-    )
-    session = store.get_or_create(
-        workspace_id="ws",
-        channel="slack",
-        external_thread_key="t",
-        backend_name="codex",
-        max_rounds=50,
-    )
-    assert session.session_id  # creation succeeded
+        store = SQLAlchemySessionStore(
+            postgres_url,
+            schema=schema_name,
+            table_prefix=unique_table_prefix,
+        )
+        session = store.get_or_create(
+            workspace_id="ws",
+            channel="slack",
+            external_thread_key="t",
+            backend_name="codex",
+            max_rounds=50,
+        )
+        assert session.session_id  # creation succeeded
 
-    # Verify the table actually lives in the named schema
-    with sqlalchemy.create_engine(postgres_url).begin() as conn:
-        exists = conn.execute(
-            sqlalchemy.text(
-                "SELECT EXISTS ("
-                "  SELECT FROM information_schema.tables"
-                "  WHERE table_schema = :schema"
-                "  AND table_name = :table_name"
-                ")"
-            ),
-            {"schema": schema_name, "table_name": f"{unique_table_prefix}sessions"},
-        ).scalar()
-        assert exists is True
+        # Verify the table actually lives in the named schema
+        with raw_engine.begin() as conn:
+            exists = conn.execute(
+                sqlalchemy.text(
+                    "SELECT EXISTS ("
+                    "  SELECT FROM information_schema.tables"
+                    "  WHERE table_schema = :schema"
+                    "  AND table_name = :table_name"
+                    ")"
+                ),
+                {"schema": schema_name, "table_name": f"{unique_table_prefix}sessions"},
+            ).scalar()
+            assert exists is True
+    finally:
+        raw_engine.dispose()

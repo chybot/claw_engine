@@ -25,10 +25,10 @@ pytest -q -m integration tests/
 Expected output (when Docker available, first run pulls image ~80MB):
 
 ```
-9 passed in ~10s
+9 passed, 3 skipped in ~10s
 ```
 
-The 9 integration-marked cases are:
+The 9 integration-marked cases that PASS are:
 - 5 in `tests/integration/test_sqlalchemy_session_store_integration.py`
   1. `test_postgres_fixture_url_passes_p8e_validation`
   2. `test_concurrent_get_or_create_deterministically_triggers_integrity_error_on_postgres` (P1-#2 killer)
@@ -41,13 +41,17 @@ The 9 integration-marked cases are:
   3. `test_save_persists_turn[sqlalchemy-postgres]`
   4. `test_dedup_tracks_message_ids[sqlalchemy-postgres]`
 
+Additionally, 3 MySQL stubs (`test_mysql_*`) are collected and unconditionally
+`pytest.skip("-> P9a.1")`, bringing the total `pytest -m integration` collection
+count to **12 (9 pass + 3 skip)**.
+
 ## Three invocation forms
 
-| Command | Cases | Docker needed |
-|---|---|---|
-| `pytest -q -m "not integration"` | 519 baseline (default CI) | No |
-| `pytest -q -m integration tests/` | 9 integration cases | Yes |
-| `pytest -q` (no filter) | 528 total | Yes |
+| Command | Collected | Result | Docker needed |
+|---|---|---|---|
+| `pytest -q -m "not integration"` | 519 | 519 passed, 12 deselected | No |
+| `pytest -q -m integration tests/` | 12 | 9 passed, 3 skipped, 519 deselected | Yes |
+| `pytest -q` (no filter) | 531 | 528 passed, 3 skipped | Yes |
 
 ## Default CI
 
