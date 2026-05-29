@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -273,16 +273,19 @@ def openbao_container() -> Iterator["VaultContainer"]:
             .with_env("BAO_DEV_ROOT_TOKEN_ID", _TEST_TOKEN_SENTINEL)
             .with_env("BAO_DEV_LISTEN_ADDRESS", "0.0.0.0:8200")
         )
-        container.start()
+        # I1 fix: use context-manager protocol so container.stop() runs even if
+        # a test using this fixture raises an exception that bubbles through yield.
+        # Symmetric with postgres_container above. Bare yield + stop() would leak
+        # the container (port 8200 held forever on Colima/Rancher where Ryuk is
+        # disabled), causing subsequent runs to fail with port collisions.
+        with container as c:
+            yield c
     except Exception as exc:  # noqa: BLE001
         # Covers: docker.errors.DockerException, ConnectionError, healthcheck timeout,
         # and any testcontainers startup failure (image pull, network, etc.).
         pytest.skip(
             f"Docker daemon not available or OpenBao container failed to start: {exc}"
         )
-
-    yield container
-    container.stop()
 
 
 @pytest.fixture
@@ -328,7 +331,10 @@ def openbao_bad_token() -> str:
 
 
 @pytest.fixture
-def seed_secret(openbao_endpoint: str, openbao_token: str):
+def seed_secret(
+    openbao_endpoint: str,
+    openbao_token: str,
+) -> Callable[[str, dict[str, str]], None]:
     """Return a helper closure that seeds a KV v2 secret at the given path.
 
     The helper POSTs to /v1/secret/data/{path} using requests (no hvac,
