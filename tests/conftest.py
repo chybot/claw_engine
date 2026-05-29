@@ -27,18 +27,31 @@ Install-matrix robustness (P9a code-review round 2):
   This matters for the partial-install case: sqlalchemy installed but
   testcontainers missing — the sqlalchemy-postgres parametrize case in
   tests/contract/test_sessionstore_contract.py must skip cleanly, not error.
+
+OpenBao fixtures (P9b):
+  openbao_container, openbao_endpoint, openbao_token, openbao_bad_token, and
+  seed_secret are added alongside the Postgres fixtures. Same UNCONDITIONAL
+  definition pattern applies — testcontainers gating happens INSIDE the
+  fixture body via importorskip.
+
+  Two-sentinel design (§4.5):
+  - _TEST_TOKEN_SENTINEL: the GOOD dev root token; transmitted in network-error tests
+  - _TEST_BAD_TOKEN_SENTINEL: the BAD sentinel; transmitted in auth-error tests
+  Both are shaped distinctly enough to grep without false positives.
+  HC-D tests scan the sentinel that was ACTUALLY TRANSMITTED in the failing request.
 """
 from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
 if TYPE_CHECKING:  # pragma: no cover — type-only import
     from testcontainers.postgres import PostgresContainer
+    from testcontainers.vault import VaultContainer
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +61,18 @@ if TYPE_CHECKING:  # pragma: no cover — type-only import
 # Pinned to a specific minor for full reproducibility (not `:16-alpine` floating tag).
 # Bump explicitly in a follow-up PR; do NOT change to a floating tag.
 _POSTGRES_IMAGE = "postgres:16.4-alpine"
+
+# OpenBao image — pinned to 2.0.0 (verified published at implementation time).
+# openbao/openbao:2.0.0 is the official release; bump explicitly if needed.
+_OPENBAO_IMAGE = "openbao/openbao:2.0.0"
+
+# Two sentinel tokens for OpenBao HC-D leakage tests.
+# Shaped distinctly enough to grep across logs/CI output without false positives.
+# The good sentinel is used as the dev root token (BAO_DEV_ROOT_TOKEN_ID).
+# The bad sentinel is only used in HC-D auth-error tests (never transmitted on
+# successful requests).
+_TEST_TOKEN_SENTINEL = "OPENBAO-TEST-ROOT-DO-NOT-LEAK"
+_TEST_BAD_TOKEN_SENTINEL = "OPENBAO-BAD-TOKEN-DO-NOT-LEAK"
 
 # Container startup timeout in seconds. Override via env for slower CI runners.
 # Wired into testcontainers_config.timeout inside postgres_container().
@@ -181,3 +206,156 @@ def unique_table_prefix() -> str:
 
 # Silence unused-import warning when TYPE_CHECKING is False at runtime.
 _ = Any
+
+
+# ---------------------------------------------------------------------------
+# OpenBao fixtures (P9b) — UNCONDITIONAL definitions; gating inside body
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def openbao_container() -> Iterator["VaultContainer"]:
+    """Start an OpenBao container in dev mode once per pytest session.
+
+    Image: openbao/openbao:2.0.0 (pinned minor — see _OPENBAO_IMAGE).
+    Root token: _TEST_TOKEN_SENTINEL (set via BAO_DEV_ROOT_TOKEN_ID env var).
+    Listen address: 0.0.0.0:8200 (set via BAO_DEV_LISTEN_ADDRESS env var).
+
+    Container choice (§2.2 of P9b sub-plan):
+      PRIMARY PATH — VaultContainer(image="openbao/openbao:2.0.0") with explicit
+      BAO_DEV_* env vars. VaultContainer's __init__ sets VAULT_DEV_ROOT_TOKEN_ID
+      via root_token kwarg (the HashiCorp Vault env var alias). We ALSO set
+      BAO_DEV_ROOT_TOKEN_ID explicitly via .with_env() because OpenBao documents
+      BAO_* as the canonical prefix and we must not rely on alias compatibility.
+      VaultContainer's _healthcheck polls /v1/sys/health; OpenBao returns HTTP 200
+      for an active/unsealed instance — same response shape as HashiCorp Vault,
+      so the healthcheck succeeds. Primary path used.
+
+      FALLBACK PATH (documented but not used) — if VaultContainer's healthcheck
+      fails for OpenBao (e.g. response shape changes in a future version), fall
+      back to DockerContainer with wait_for_logs("core: post-unseal setup complete").
+      See §2.2 fallback code snippet in the sub-plan for the pattern.
+
+    Skip behaviour (matters for the install matrix):
+      - testcontainers not installed → importorskip → clean Skipped (not error)
+      - Docker daemon unreachable → except Exception → pytest.skip with message
+      - Container start fails → same path → clean skip
+
+    Colima / Rancher Desktop socket note:
+      Same ryuk_disabled logic as postgres_container — applied consistently.
+    """
+    pytest.importorskip(
+        "testcontainers",
+        reason=(
+            "testcontainers not installed — OpenBao integration tests require Docker. "
+            "Install with: pip install -e '.[secrets-openbao,integration]'"
+        ),
+    )
+
+    from testcontainers.core.config import testcontainers_config as tc_config
+    from testcontainers.vault import VaultContainer
+
+    tc_config.max_tries = int(_TC_TIMEOUT / max(tc_config.sleep_time, 0.1))
+
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    if docker_host and "/var/run/docker.sock" not in docker_host:
+        tc_config.ryuk_disabled = True
+
+    try:
+        # VaultContainer.__init__ sets VAULT_DEV_ROOT_TOKEN_ID via root_token kwarg.
+        # We also set BAO_DEV_ROOT_TOKEN_ID explicitly — OpenBao's canonical env var.
+        # Both are set; redundancy is intentional (never rely on alias compatibility).
+        container = (
+            VaultContainer(
+                image=_OPENBAO_IMAGE,
+                root_token=_TEST_TOKEN_SENTINEL,
+            )
+            .with_env("BAO_DEV_ROOT_TOKEN_ID", _TEST_TOKEN_SENTINEL)
+            .with_env("BAO_DEV_LISTEN_ADDRESS", "0.0.0.0:8200")
+        )
+        # I1 fix: use context-manager protocol so container.stop() runs even if
+        # a test using this fixture raises an exception that bubbles through yield.
+        # Symmetric with postgres_container above. Bare yield + stop() would leak
+        # the container (port 8200 held forever on Colima/Rancher where Ryuk is
+        # disabled), causing subsequent runs to fail with port collisions.
+        with container as c:
+            yield c
+    except Exception as exc:  # noqa: BLE001
+        # Covers: docker.errors.DockerException, ConnectionError, healthcheck timeout,
+        # and any testcontainers startup failure (image pull, network, etc.).
+        pytest.skip(
+            f"Docker daemon not available or OpenBao container failed to start: {exc}"
+        )
+
+
+@pytest.fixture
+def openbao_endpoint(openbao_container: "VaultContainer") -> str:
+    """Return the OpenBao base URL (e.g. 'http://localhost:54321').
+
+    Credential-free — caller passes the token separately via openbao_token
+    fixture (HC-C: credentials never embedded in URL).
+
+    Automatic skip: inherits skip from openbao_container if Docker unavailable.
+    """
+    host = openbao_container.get_container_host_ip()
+    port = openbao_container.get_exposed_port(8200)
+    return f"http://{host}:{port}"
+
+
+@pytest.fixture
+def openbao_token() -> str:
+    """Return the GOOD dev root token sentinel.
+
+    This is the token transmitted by happy-path and network-error tests.
+    HC-D network-error test scans for this sentinel — the token actually
+    transmitted in the failing request.
+
+    Note: openbao_container sets BAO_DEV_ROOT_TOKEN_ID to this same value,
+    so this fixture is the correct credential for successful OpenBao calls.
+    """
+    return _TEST_TOKEN_SENTINEL
+
+
+@pytest.fixture
+def openbao_bad_token() -> str:
+    """Return the BAD token sentinel for HC-D auth-error tests.
+
+    This token is transmitted in the failing auth request (OpenBao returns
+    401/403 because it's not a valid root token). HC-D auth-error test scans
+    for this sentinel — the token actually transmitted in the failing request.
+
+    The good root token (_TEST_TOKEN_SENTINEL) is NEVER transmitted on auth-
+    error paths, so scanning for it there would be a false-green.
+    """
+    return _TEST_BAD_TOKEN_SENTINEL
+
+
+@pytest.fixture
+def seed_secret(
+    openbao_endpoint: str,
+    openbao_token: str,
+) -> Callable[[str, dict[str, str]], None]:
+    """Return a helper closure that seeds a KV v2 secret at the given path.
+
+    The helper POSTs to /v1/secret/data/{path} using requests (no hvac,
+    mirroring the P8d adapter decision — see sub-plan §1 rationale).
+
+    Usage:
+        seed_secret("claw/workspaces/ws-1", {"OPENAI_KEY": "sk-test"})
+
+    Raises if the POST fails (HTTP error → requests.HTTPError via raise_for_status).
+    Automatic skip: inherits skip from openbao_endpoint → openbao_container.
+    """
+    import requests as _requests
+
+    def _seed(path: str, data: dict[str, str]) -> None:
+        url = f"{openbao_endpoint}/v1/secret/data/{path}"
+        resp = _requests.post(
+            url,
+            headers={"X-Vault-Token": openbao_token},
+            json={"data": data},
+            timeout=10,
+        )
+        resp.raise_for_status()
+
+    return _seed
