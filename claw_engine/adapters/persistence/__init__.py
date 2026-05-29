@@ -1,0 +1,1 @@
+# persistence adapter package stub

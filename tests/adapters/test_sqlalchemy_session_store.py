@@ -1,0 +1,610 @@
+"""P8e: SQLAlchemySessionStore — invariant + Hard Contract tests.
+
+All tests run against SQLite in-memory (no external infrastructure).
+mysql/postgres integration tests deferred to tests/integration/ (see below).
+
+Test gating: entire module is skipped if sqlalchemy is not installed.
+"""
+from __future__ import annotations
+
+import threading
+import tempfile
+import os
+
+import pytest
+
+# Gate: skip entire module if sqlalchemy is not installed.
+pytest.importorskip("sqlalchemy", reason="sqlalchemy not installed (pip install -e .[persistence-sqlalchemy])")
+
+import sqlalchemy  # noqa: E402
+
+from claw_engine.adapters.persistence.sqlalchemy import (  # noqa: E402
+    SQLAlchemySessionStore,
+    SessionStoreError,
+)
+from claw_engine.engine.persistence.contracts import SessionStore  # noqa: E402
+
+# ── Sentinel password used in HC-C tests ─────────────────────────────────────
+
+SENTINEL_PW = "PLAINTEXT-PW-DO-NOT-LEAK"
+
+
+def assert_no_password_leak(text: str) -> None:
+    """Assert the sentinel password does not appear in `text`."""
+    assert SENTINEL_PW not in text, (
+        f"Password leaked in output text. Offending string (truncated):\n"
+        f"  {text[:300]!r}"
+    )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def make_sqlite_store(prefix: str = "claw_") -> SQLAlchemySessionStore:
+    """Create a fresh in-memory SQLite store."""
+    return SQLAlchemySessionStore("sqlite:///:memory:", table_prefix=prefix)
+
+
+_KW = dict(
+    workspace_id="w",
+    channel="c",
+    external_thread_key="t",
+    backend_name="fake",
+    max_rounds=50,
+)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HC-A: Construction is hermetic (no DB IO)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_construction_does_no_db_io(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HC-A: __init__ must not call sqlalchemy.create_engine.
+
+    Monkey-patch create_engine to raise; construction must still succeed.
+    """
+    def bomb(*args, **kwargs):
+        raise AssertionError("sqlalchemy.create_engine must NOT be called in __init__")
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", bomb)
+
+    store = SQLAlchemySessionStore("sqlite:///test.db")
+    assert store is not None
+    assert store._engine is None  # lazy — not yet created
+
+
+def test_engine_is_none_before_first_call() -> None:
+    """HC-A: _engine attribute is None directly after construction."""
+    store = SQLAlchemySessionStore("sqlite:///test.db")
+    assert store._engine is None
+
+
+def test_construction_validates_url_scheme() -> None:
+    """HC-A: unsupported DSN schemes raise ValueError."""
+    bad_schemes = [
+        "oracle+cx_oracle://user/pass@host/db",
+        "mssql+pyodbc://user:pass@host/db",
+        "firebird+fdb://user:pass@host/db",
+        "db2://user:pass@host/db",
+    ]
+    for bad_url in bad_schemes:
+        with pytest.raises(ValueError, match="scheme"):
+            SQLAlchemySessionStore(bad_url)
+
+
+def test_construction_accepts_supported_schemes() -> None:
+    """HC-A: sqlite, mysql, mysql+pymysql, postgresql, postgresql+psycopg all accepted."""
+    good_urls = [
+        "sqlite:///test.db",
+        "sqlite:///:memory:",
+        "mysql://host/db",
+        "mysql+pymysql://host/db",
+        "postgresql://host/db",
+        "postgresql+psycopg://host/db",
+    ]
+    for url in good_urls:
+        store = SQLAlchemySessionStore(url)
+        assert store is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HC-C: DSN credentials rejected; never leak via repr / str / exception
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_construction_rejects_url_with_credentials() -> None:
+    """HC-C: DSN with embedded user:pass raises ValueError."""
+    bad_urls = [
+        f"postgresql://user:{SENTINEL_PW}@host/db",
+        "mysql+pymysql://admin:secret@host/mydb",
+        "postgresql://user@host/db",
+    ]
+    for bad_url in bad_urls:
+        with pytest.raises(ValueError):
+            SQLAlchemySessionStore(bad_url)
+
+
+def test_construction_rejection_message_does_not_leak_password() -> None:
+    """HC-C: the ValueError message from credential rejection must not echo the password."""
+    bad_url = f"postgresql://user:{SENTINEL_PW}@host/db"
+    with pytest.raises(ValueError) as exc_info:
+        SQLAlchemySessionStore(bad_url)
+    error_text = str(exc_info.value)
+    assert_no_password_leak(error_text)
+    assert_no_password_leak(repr(exc_info.value))
+
+
+def test_repr_does_not_leak_url_password() -> None:
+    """HC-C: __repr__ redacts password even when _url is mutated post-construction.
+
+    Bypass constructor validation by directly setting _url to a URL with the
+    sentinel password — verifies belt-and-suspenders repr redaction.
+    """
+    store = SQLAlchemySessionStore("sqlite:///:memory:")
+    # Bypass validation by directly mutating
+    store._url = f"postgresql://user:{SENTINEL_PW}@host/db"
+
+    repr_text = repr(store)
+    str_text = str(store)
+    assert_no_password_leak(repr_text)
+    assert_no_password_leak(str_text)
+    # SQLAlchemy's hide_password=True replaces password with ***
+    assert "***" in repr_text or SENTINEL_PW not in repr_text
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    ["password", "passwd", "pwd", "auth_token", "api_key", "secret", "foo", "bar123"],
+)
+def test_construction_rejects_url_with_unknown_query(bad_key: str) -> None:
+    """HC-C: DSN with query param not in allowlist raises ValueError."""
+    bad_url = f"postgresql://host/db?{bad_key}=value"
+    with pytest.raises(ValueError, match="query key"):
+        SQLAlchemySessionStore(bad_url)
+
+
+@pytest.mark.parametrize(
+    "good_key",
+    [
+        "connect_timeout",
+        "charset",
+        "sslmode",
+        "sslrootcert",
+        "sslcert",
+        "sslkey",
+        "application_name",
+        "ssl_ca",
+        "ssl_cert",
+        "ssl_key",
+        "ssl_verify_cert",
+        "ssl_verify_identity",
+    ],
+)
+def test_construction_accepts_allowed_query_keys(good_key: str) -> None:
+    """HC-C: all 12 allowlist query keys are accepted."""
+    url = f"postgresql://host/db?{good_key}=value"
+    store = SQLAlchemySessionStore(url)
+    assert store is not None
+
+
+def test_construction_validates_table_prefix_bad_chars() -> None:
+    """table_prefix with bad chars raises ValueError."""
+    bad_prefixes = [
+        "1starts_with_digit",
+        "has space",
+        "has-dash",
+        "has.dot",
+        "has/slash",
+    ]
+    for bad in bad_prefixes:
+        with pytest.raises(ValueError, match="table_prefix"):
+            SQLAlchemySessionStore("sqlite:///:memory:", table_prefix=bad)
+
+
+def test_construction_validates_table_prefix_too_long() -> None:
+    """table_prefix longer than 32 chars raises ValueError."""
+    long_prefix = "a" * 33
+    with pytest.raises(ValueError, match="table_prefix"):
+        SQLAlchemySessionStore("sqlite:///:memory:", table_prefix=long_prefix)
+
+
+def test_construction_accepts_empty_table_prefix() -> None:
+    """table_prefix='' (no prefix) is valid."""
+    store = SQLAlchemySessionStore("sqlite:///:memory:", table_prefix="")
+    assert store is not None
+
+
+def test_construction_validates_schema_name_bad_chars() -> None:
+    """schema with bad chars raises ValueError."""
+    bad_schemas = ["1invalid", "has space", "has-dash", "has.dot"]
+    for bad in bad_schemas:
+        with pytest.raises(ValueError, match="schema"):
+            SQLAlchemySessionStore("sqlite:///:memory:", schema=bad)
+
+
+def test_construction_validates_schema_name_sql_keyword() -> None:
+    """schema that is a SQL keyword raises ValueError."""
+    sql_keywords = ["select", "from", "where", "drop", "table"]
+    for kw in sql_keywords:
+        with pytest.raises(ValueError, match="schema|keyword"):
+            SQLAlchemySessionStore("sqlite:///:memory:", schema=kw)
+
+
+def test_construction_accepts_valid_schema() -> None:
+    """Valid schema names are accepted."""
+    good_schemas = ["public", "myapp", "claw_prod", "workspace01"]
+    for schema in good_schemas:
+        store = SQLAlchemySessionStore("sqlite:///:memory:", schema=schema)
+        assert store is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Lazy connection / engine management
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_first_call_creates_engine() -> None:
+    """Engine is None before first call, non-None after."""
+    store = make_sqlite_store()
+    assert store._engine is None
+    store.get_or_create(**_KW)
+    assert store._engine is not None
+
+
+def test_engine_reused_across_calls() -> None:
+    """Same Engine instance is reused on subsequent calls."""
+    store = make_sqlite_store()
+    store.get_or_create(**_KW)
+    engine_a = store._engine
+    store.get_or_create(**_KW)
+    engine_b = store._engine
+    assert engine_a is engine_b
+
+
+def test_concurrent_first_call_does_not_double_create() -> None:
+    """Two threads calling get_or_create simultaneously create only one Engine.
+
+    Uses a threading.Barrier to synchronise both threads at the moment just
+    before calling _ensure_engine, then verifies that exactly one Engine was
+    created (double-checked locking in _ensure_engine prevents double-create).
+
+    Uses a file-based SQLite so that all threads share the same connection pool
+    (in-memory SQLite gives each connection an isolated empty database, which
+    would fail schema-not-found checks in the second thread).
+    """
+    import time
+
+    original_create_engine = sqlalchemy.create_engine
+    create_count = [0]
+    count_lock = threading.Lock()
+
+    def counting_create_engine(*args, **kwargs):
+        with count_lock:
+            create_count[0] += 1
+        # Widen the race window so the second thread can observe the unfinished
+        # engine-creation path and hit the double-check in the lock
+        time.sleep(0.02)
+        return original_create_engine(*args, **kwargs)
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+
+    try:
+        store = SQLAlchemySessionStore(f"sqlite:///{db_path}")
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
+
+        def worker():
+            try:
+                barrier.wait()  # Both threads start at the same time
+                store.get_or_create(**_KW)
+            except Exception as e:
+                errors.append(e)
+
+        sqlalchemy.create_engine = counting_create_engine
+        try:
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
+        finally:
+            sqlalchemy.create_engine = original_create_engine
+
+        assert not errors, f"Thread errors: {errors}"
+        assert create_count[0] == 1, (
+            f"create_engine called {create_count[0]} times, expected exactly 1"
+        )
+        # Single Engine instance must be shared
+        assert store._engine is not None
+    finally:
+        os.unlink(db_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HC-B: Schema migration — create-only, idempotent
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_schema_migration_idempotent() -> None:
+    """HC-B: creating tables twice (two adapter instances, same file) does not error."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+
+    try:
+        url = f"sqlite:///{db_path}"
+        store1 = SQLAlchemySessionStore(url)
+        store1.get_or_create(**_KW)
+
+        # Second adapter against same file — should not error
+        store2 = SQLAlchemySessionStore(url)
+        result = store2.get_or_create(**_KW)
+        assert result is not None
+    finally:
+        os.unlink(db_path)
+
+
+def test_schema_migration_never_drops_or_alters() -> None:
+    """HC-B: only CREATE TABLE statements emitted; no DROP or ALTER.
+
+    Hook into Engine events to capture all DDL strings and assert none
+    contain 'DROP' or 'ALTER'.
+    """
+    store = SQLAlchemySessionStore("sqlite:///:memory:")
+    # Trigger engine creation
+    store._ensure_engine()
+    engine = store._engine
+    assert engine is not None
+
+    captured_statements: list[str] = []
+
+    @sqlalchemy.event.listens_for(engine, "before_cursor_execute")
+    def capture_ddl(conn, cursor, statement, params, context, executemany):
+        captured_statements.append(statement)
+
+    # Force a second ensure_engine call (no-op but proves idempotency)
+    engine2 = store._ensure_engine()
+    assert engine2 is engine  # same instance
+
+    # Perform another get_or_create to trigger more SQL
+    store.get_or_create(**_KW)
+
+    # Assert no DROP or ALTER in any captured statement
+    for stmt in captured_statements:
+        upper = stmt.upper()
+        assert "DROP" not in upper, f"Found DROP in statement: {stmt!r}"
+        assert "ALTER" not in upper, f"Found ALTER in statement: {stmt!r}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CRUD via Protocol
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_get_or_create_creates_new_session() -> None:
+    """First get_or_create creates a new session with all required fields."""
+    store = make_sqlite_store()
+    session = store.get_or_create(**_KW)
+    assert session.session_id
+    assert session.workspace_id == "w"
+    assert session.channel == "c"
+    assert session.external_thread_key == "t"
+    assert session.backend_name == "fake"
+    assert session.max_rounds == 50
+    assert session.round_count == 0
+    assert session.backend_thread_id is None
+
+
+def test_get_or_create_returns_existing_session() -> None:
+    """Second get_or_create with same natural key returns same session_id."""
+    store = make_sqlite_store()
+    s1 = store.get_or_create(**_KW)
+    s2 = store.get_or_create(
+        workspace_id="w", channel="c", external_thread_key="t",
+        backend_name="other", max_rounds=10,
+    )
+    assert s1.session_id == s2.session_id
+    assert s2.backend_name == "fake"   # existing wins
+    assert s2.max_rounds == 50
+
+
+def test_get_or_create_different_natural_key_different_session() -> None:
+    """Different natural keys produce different sessions."""
+    store = make_sqlite_store()
+    a = store.get_or_create(**{**_KW, "external_thread_key": "t1"})
+    b = store.get_or_create(**{**_KW, "external_thread_key": "t2"})
+    assert a.session_id != b.session_id
+
+
+def test_save_updates_existing_session() -> None:
+    """save() with updated round_count persists to the store."""
+    store = make_sqlite_store()
+    s = store.get_or_create(**_KW)
+    updated = s.with_turn(backend_thread_id="bt_1", now=123.0)
+    store.save(updated)
+
+    again = store.get_or_create(**_KW)
+    assert again.backend_thread_id == "bt_1"
+    assert again.round_count == 1
+    assert again.last_active == 123.0
+
+
+def test_save_does_not_create_new_session() -> None:
+    """save() of an unknown session_id is a no-op (no rows created)."""
+    from claw_engine.engine.persistence.contracts import Session
+    store = make_sqlite_store()
+
+    phantom = Session(
+        session_id="nonexistent-id",
+        workspace_id="w",
+        channel="c",
+        external_thread_key="t",
+        backend_name="fake",
+        max_rounds=50,
+    )
+    # Should not raise, should be a no-op
+    store.save(phantom)
+
+    # A real get_or_create should create a NEW session (not find the phantom)
+    real = store.get_or_create(**_KW)
+    assert real.session_id != "nonexistent-id"
+
+
+def test_is_processed_returns_false_initially() -> None:
+    """Fresh session has no processed messages."""
+    store = make_sqlite_store()
+    s = store.get_or_create(**_KW)
+    assert not store.is_processed(s.session_id, "msg-1")
+
+
+def test_mark_processed_then_is_processed_true() -> None:
+    """After mark_processed, is_processed returns True."""
+    store = make_sqlite_store()
+    s = store.get_or_create(**_KW)
+    store.mark_processed(s.session_id, "msg-1")
+    assert store.is_processed(s.session_id, "msg-1")
+    assert not store.is_processed(s.session_id, "msg-2")
+
+
+def test_mark_processed_idempotent() -> None:
+    """Calling mark_processed twice does not raise."""
+    store = make_sqlite_store()
+    s = store.get_or_create(**_KW)
+    store.mark_processed(s.session_id, "msg-1")
+    store.mark_processed(s.session_id, "msg-1")  # should not error
+    assert store.is_processed(s.session_id, "msg-1")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Protocol compatibility
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_isinstance_session_store() -> None:
+    """isinstance(adapter, SessionStore) is True via runtime_checkable."""
+    store = make_sqlite_store()
+    assert isinstance(store, SessionStore)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Field validation at adapter boundary
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_get_or_create_rejects_empty_workspace_id() -> None:
+    store = make_sqlite_store()
+    with pytest.raises(ValueError, match="workspace_id"):
+        store.get_or_create(**{**_KW, "workspace_id": ""})
+
+
+def test_get_or_create_rejects_workspace_id_too_long() -> None:
+    store = make_sqlite_store()
+    with pytest.raises(ValueError, match="workspace_id"):
+        store.get_or_create(**{**_KW, "workspace_id": "a" * 129})
+
+
+def test_get_or_create_rejects_empty_channel() -> None:
+    store = make_sqlite_store()
+    with pytest.raises(ValueError, match="channel"):
+        store.get_or_create(**{**_KW, "channel": ""})
+
+
+def test_get_or_create_rejects_channel_too_long() -> None:
+    store = make_sqlite_store()
+    with pytest.raises(ValueError, match="channel"):
+        store.get_or_create(**{**_KW, "channel": "a" * 65})
+
+
+def test_get_or_create_accepts_channel_with_special_chars() -> None:
+    """Channel can contain colons, slashes, hashes (valid thread key chars)."""
+    store = make_sqlite_store()
+    session = store.get_or_create(
+        **{**_KW, "channel": "slack:T01ABC#general/thread/123"}
+    )
+    assert session is not None
+
+
+def test_get_or_create_rejects_empty_external_thread_key() -> None:
+    store = make_sqlite_store()
+    with pytest.raises(ValueError, match="external_thread_key"):
+        store.get_or_create(**{**_KW, "external_thread_key": ""})
+
+
+def test_get_or_create_rejects_external_thread_key_too_long() -> None:
+    store = make_sqlite_store()
+    with pytest.raises(ValueError, match="external_thread_key"):
+        store.get_or_create(**{**_KW, "external_thread_key": "a" * 257})
+
+
+def test_is_processed_rejects_empty_session_id() -> None:
+    store = make_sqlite_store()
+    with pytest.raises(ValueError, match="session_id"):
+        store.is_processed("", "msg-1")
+
+
+def test_is_processed_rejects_empty_message_id() -> None:
+    store = make_sqlite_store()
+    with pytest.raises(ValueError, match="message_id"):
+        store.is_processed("sid-1", "")
+
+
+def test_mark_processed_rejects_empty_session_id() -> None:
+    store = make_sqlite_store()
+    with pytest.raises(ValueError, match="session_id"):
+        store.mark_processed("", "msg-1")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Table prefix isolation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_table_prefix_isolation() -> None:
+    """Two adapters with different table_prefix share a sqlite DB without cross-contamination."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+
+    try:
+        url = f"sqlite:///{db_path}"
+        store_a = SQLAlchemySessionStore(url, table_prefix="alpha_")
+        store_b = SQLAlchemySessionStore(url, table_prefix="beta_")
+
+        # Create session in store_a
+        sa = store_a.get_or_create(
+            workspace_id="w", channel="c", external_thread_key="t",
+            backend_name="fake", max_rounds=10,
+        )
+
+        # store_b must create a new session (different table)
+        sb = store_b.get_or_create(
+            workspace_id="w", channel="c", external_thread_key="t",
+            backend_name="fake", max_rounds=10,
+        )
+
+        # Different session_ids from different tables
+        assert sa.session_id != sb.session_id
+    finally:
+        os.unlink(db_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SessionStoreError
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_session_store_error_str() -> None:
+    err = SessionStoreError("some problem", stage="init")
+    assert "init" in str(err)
+    assert "some problem" in str(err)
+
+
+def test_session_store_error_repr() -> None:
+    err = SessionStoreError("some problem", stage="query")
+    assert "SessionStoreError" in repr(err)
+    assert "query" in repr(err)
+
+
+def test_session_store_error_no_stage() -> None:
+    err = SessionStoreError("problem without stage")
+    assert err.stage is None
+    assert "problem without stage" in str(err)
