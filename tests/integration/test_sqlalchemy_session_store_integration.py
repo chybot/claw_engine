@@ -1,20 +1,16 @@
-"""P9a integration tests: SQLAlchemySessionStore against real Postgres via testcontainers.
+"""Integration tests: SQLAlchemySessionStore against real SQL backends.
 
-These tests use testcontainers to spin up a real Postgres container. They are
+These tests use testcontainers to spin up real database containers. They are
 expensive and require Docker, so they are gated with @pytest.mark.integration
 and skipped in default CI.
 
-MySQL tests are marked pytest.skip("-> P9a.1") — MySQL integration requires a
-small adapter extension (connect_args) to work around the credential-free DSN
-constraint. See sub-plan §1.1 for full rationale.
-
 Run with:
     pytest -q -m integration tests/
-    (use `tests/` NOT `tests/integration/` — the postgres contract cases in
+    (use `tests/` NOT `tests/integration/` — the SQLAlchemy contract cases in
     tests/contract/test_sessionstore_contract.py would be missed otherwise)
 
 Prerequisites:
-    pip install -e ".[persistence-postgres,integration]"
+    pip install -e ".[persistence-postgres,persistence-mysql,integration]"
     Docker daemon running
 """
 from __future__ import annotations
@@ -24,53 +20,159 @@ import uuid
 
 import pytest
 
-# Gate ALL optional imports — collection must succeed under a clean .[dev] install
-# where neither sqlalchemy nor testcontainers is present. importorskip raises
-# Skipped during collection, which pytest handles cleanly (module skipped, no error).
-# Order matters: sqlalchemy first because every heavy import below transitively
-# needs it; testcontainers second because the fixtures (in tests/conftest.py)
-# already guard their own usage.
+# Gate only imports this module uses directly. testcontainers is deliberately
+# gated inside fixture bodies in tests/conftest.py so `pytest -m "not integration"`
+# can deselect this file without producing a collection-time testcontainers skip.
 pytest.importorskip(
     "sqlalchemy",
     reason=(
         "sqlalchemy not installed — integration tests require the SQLAlchemy adapter. "
-        "Install with: pip install -e '.[persistence-postgres,integration]'"
-    ),
-)
-pytest.importorskip(
-    "testcontainers",
-    reason=(
-        "testcontainers not installed — integration tests require Docker. "
-        "Install with: pip install -e '.[persistence-postgres,integration]'"
+        "Install with: pip install -e "
+        "'.[persistence-postgres,persistence-mysql,integration]'"
     ),
 )
 
-# Safe to import the heavy stuff now (both gates passed).
+# Safe to import the heavy stuff now (sqlalchemy gate passed).
 import sqlalchemy  # noqa: E402
 
 from claw_engine.adapters.persistence.sqlalchemy import SQLAlchemySessionStore  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# MySQL stubs — deferred to P9a.1
+# MySQL tests
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
-def test_mysql_end_to_end_crud() -> None:
-    """Deferred to P9a.1 (requires connect_args adapter extension for credential-free DSN)."""
-    pytest.skip("-> P9a.1")
+def test_mysql_end_to_end_crud_with_connect_args_auth(
+    mysql_dsn_and_connect_args: tuple[str, dict[str, object]],
+    unique_table_prefix: str,
+) -> None:
+    """MySQL end-to-end SessionStore CRUD via credential-free DSN + connect_args."""
+    dsn, connect_args = mysql_dsn_and_connect_args
+    assert "@" not in dsn
+    assert "test:test" not in dsn
+
+    natural_key = dict(
+        workspace_id="ws",
+        channel="slack",
+        external_thread_key="t",
+        backend_name="codex",
+        max_rounds=50,
+    )
+    store = SQLAlchemySessionStore(
+        dsn,
+        table_prefix=unique_table_prefix,
+        connect_args=connect_args,
+    )
+
+    session = store.get_or_create(**natural_key)
+    assert session.session_id
+    assert session.backend_thread_id is None
+    assert session.round_count == 0
+
+    again = store.get_or_create(
+        workspace_id="ws",
+        channel="slack",
+        external_thread_key="t",
+        backend_name="other",
+        max_rounds=10,
+    )
+    assert again.session_id == session.session_id
+    assert again.backend_name == "codex"
+    assert again.max_rounds == 50
+
+    store.save(session.with_turn(backend_thread_id="mysql-thread-1", now=123.0))
+    saved = store.get_or_create(**natural_key)
+    assert saved.backend_thread_id == "mysql-thread-1"
+    assert saved.round_count == 1
+    assert saved.last_active == 123.0
+
+    store.mark_processed(saved.session_id, "msg-1")
+    assert store.is_processed(saved.session_id, "msg-1") is True
+    store.mark_processed(saved.session_id, "msg-1")
+    assert store.is_processed(saved.session_id, "msg-1") is True
 
 
 @pytest.mark.integration
-def test_mysql_cross_restart_durability() -> None:
-    """Deferred to P9a.1."""
-    pytest.skip("-> P9a.1")
+def test_mysql_fresh_schema_create_only(
+    mysql_dsn_and_connect_args: tuple[str, dict[str, object]],
+    unique_table_prefix: str,
+) -> None:
+    """Two stores against a fresh MySQL prefix initialize idempotently."""
+    dsn, connect_args = mysql_dsn_and_connect_args
+
+    store1 = SQLAlchemySessionStore(
+        dsn,
+        table_prefix=unique_table_prefix,
+        connect_args=connect_args,
+    )
+    created = store1.get_or_create(
+        workspace_id="ws",
+        channel="slack",
+        external_thread_key="t",
+        backend_name="codex",
+        max_rounds=50,
+    )
+    assert created.session_id
+    if store1._engine is not None:
+        store1._engine.dispose()
+
+    store2 = SQLAlchemySessionStore(
+        dsn,
+        table_prefix=unique_table_prefix,
+        connect_args=connect_args,
+    )
+    reloaded = store2.get_or_create(
+        workspace_id="ws",
+        channel="slack",
+        external_thread_key="t",
+        backend_name="other",
+        max_rounds=10,
+    )
+    assert reloaded.session_id == created.session_id
+    assert reloaded.backend_name == "codex"
+    assert reloaded.max_rounds == 50
 
 
 @pytest.mark.integration
-def test_mysql_schema_migration_on_fresh_db() -> None:
-    """Deferred to P9a.1."""
-    pytest.skip("-> P9a.1")
+def test_mysql_cross_restart_durability(
+    mysql_dsn_and_connect_args: tuple[str, dict[str, object]],
+    unique_table_prefix: str,
+) -> None:
+    """A fresh store instance sees MySQL state written by an earlier instance."""
+    dsn, connect_args = mysql_dsn_and_connect_args
+    natural_key = dict(
+        workspace_id="ws",
+        channel="slack",
+        external_thread_key="t",
+        backend_name="codex",
+        max_rounds=50,
+    )
+
+    store1 = SQLAlchemySessionStore(
+        dsn,
+        table_prefix=unique_table_prefix,
+        connect_args=connect_args,
+    )
+    session = store1.get_or_create(**natural_key)
+    saved_id = session.session_id
+    store1.save(session.with_turn(backend_thread_id="backend-thread-1", now=456.0))
+    store1.mark_processed(saved_id, "msg-1")
+    if store1._engine is not None:
+        store1._engine.dispose()
+    del store1
+
+    store2 = SQLAlchemySessionStore(
+        dsn,
+        table_prefix=unique_table_prefix,
+        connect_args=connect_args,
+    )
+    rehydrated = store2.get_or_create(**natural_key)
+    assert rehydrated.session_id == saved_id
+    assert rehydrated.backend_thread_id == "backend-thread-1"
+    assert rehydrated.round_count == 1
+    assert rehydrated.last_active == 456.0
+    assert store2.is_processed(saved_id, "msg-1") is True
 
 
 # ---------------------------------------------------------------------------

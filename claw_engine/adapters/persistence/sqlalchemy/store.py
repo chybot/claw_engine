@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import threading
 import uuid
+from collections.abc import Mapping
+from typing import Any
 
 import sqlalchemy
 import sqlalchemy.engine.url as sa_url
@@ -41,17 +43,21 @@ class SQLAlchemySessionStore:
         *,
         schema: str | None = None,
         table_prefix: str = "claw_",
+        connect_args: Mapping[str, Any] | None = None,
     ) -> None:
         """Construct the adapter.  No DB IO occurs here (HC-A).
 
         Args:
             url: SQLAlchemy DSN — sqlite:///…, mysql+pymysql://…, postgresql+psycopg://….
-                 Credentials MUST NOT be embedded (HC-C).  Use env-vars consumed
-                 by the driver or wrap through SecretProvider.
+                 Credentials MUST NOT be embedded (HC-C).  Use driver env-vars,
+                 connect_args, or SecretProvider instead.
             schema: Postgres schema name to qualify both tables.  None → default
                     search_path.  Ignored by sqlite and mysql at the DDL level.
             table_prefix: Prefix for both table names.  Default "claw_".
                           Empty string allowed; max 32 chars.
+            connect_args: Optional driver-level connection arguments passed to
+                          SQLAlchemy at engine creation time. Values are copied
+                          defensively and never advertised in repr/str.
 
         Raises:
             ValueError: Any validation failure (scheme, credentials, query keys,
@@ -64,6 +70,9 @@ class SQLAlchemySessionStore:
         self._url = url
         self._schema = schema
         self._table_prefix = table_prefix
+        self._connect_args: dict[str, Any] | None = (
+            dict(connect_args) if connect_args is not None else None
+        )
 
         # Lazy engine state (HC-A: NOT created here)
         self._engine: sqlalchemy.engine.Engine | None = None
@@ -96,7 +105,10 @@ class SQLAlchemySessionStore:
 
             engine: sqlalchemy.engine.Engine | None = None
             try:
-                engine = sqlalchemy.create_engine(self._url)
+                engine_kwargs: dict[str, Any] = {}
+                if self._connect_args is not None:
+                    engine_kwargs["connect_args"] = self._connect_args
+                engine = sqlalchemy.create_engine(self._url, **engine_kwargs)
                 sessions, processed = _build_tables(
                     self._table_prefix, schema=self._schema
                 )

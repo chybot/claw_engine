@@ -8,12 +8,14 @@ Backend roster
 | sqlite             | (none)      | No      |
 | sqlalchemy-sqlite  | (none)      | No      |
 | sqlalchemy-postgres| integration | Yes     |
+| sqlalchemy-mysql   | integration | Yes     |
 
 Fixture-aware parametrize (§4.4 of P9a sub-plan)
 -------------------------------------------------
 The existing STORES list + @pytest.mark.parametrize approach worked for backends
 whose factories could be built at module-load time. Postgres needs fixture-resolved
-values (postgres_url, unique_table_prefix) that are only available at test-run time.
+values (postgres_url / mysql_dsn_and_connect_args, unique_table_prefix) that are
+only available at test-run time.
 
 We restructure the runner to use a `make_store` fixture that dispatches on
 `request.param` and calls `request.getfixturevalue(...)` for Postgres fixtures.
@@ -22,7 +24,7 @@ helper's contract exactly.
 
 Helper file (tests/contract/sessionstore_contract.py) is UNCHANGED.
 
-Fixture scoping note: postgres_url and unique_table_prefix live in
+Fixture scoping note: postgres_url, mysql_dsn_and_connect_args, and unique_table_prefix live in
 tests/conftest.py (the top-level conftest — see that file's docstring for
 the rationale why a peer pytest_plugins re-export was rejected). pytest
 auto-discovers top-level conftest fixtures across all subpackages, so they
@@ -66,6 +68,16 @@ _BACKENDS = [
             ),
         ],
     ),
+    pytest.param(
+        "sqlalchemy-mysql",
+        marks=[
+            pytest.mark.integration,
+            pytest.mark.skipif(
+                not _SA_AVAILABLE,
+                reason="sqlalchemy not installed",
+            ),
+        ],
+    ),
 ]
 
 
@@ -73,11 +85,11 @@ _BACKENDS = [
 def make_store(request: pytest.FixtureRequest, tmp_path: object) -> object:
     """Return a Callable[[], SessionStore] factory matching the helper's contract.
 
-    For postgres, postgres_url + unique_table_prefix fixtures from
-    tests/integration/conftest.py are loaded only when the postgres case is active
-    (via request.getfixturevalue — no fixture resolution overhead for other backends).
+    For postgres/mysql, container-backed fixtures are loaded only when the
+    corresponding backend case is active (via request.getfixturevalue — no
+    fixture resolution overhead for other backends).
 
-    For sqlalchemy-sqlite and sqlalchemy-postgres: a single store instance is
+    For SQLAlchemy backends: a single store instance is
     captured and the closure returns the same instance on every call. This is
     intentional — within a single test, the helper's two make_store() calls
     (e.g. one before save and one after) must observe the same DB state.
@@ -106,6 +118,16 @@ def make_store(request: pytest.FixtureRequest, tmp_path: object) -> object:
         url: str = request.getfixturevalue("postgres_url")
         prefix: str = request.getfixturevalue("unique_table_prefix")
         store = SQLAlchemySessionStore(url, table_prefix=prefix)
+        return lambda: store
+
+    if backend == "sqlalchemy-mysql":
+        dsn, connect_args = request.getfixturevalue("mysql_dsn_and_connect_args")
+        prefix: str = request.getfixturevalue("unique_table_prefix")
+        store = SQLAlchemySessionStore(
+            dsn,
+            table_prefix=prefix,
+            connect_args=connect_args,
+        )
         return lambda: store
 
     raise ValueError(f"unknown backend {backend!r}")  # pragma: no cover

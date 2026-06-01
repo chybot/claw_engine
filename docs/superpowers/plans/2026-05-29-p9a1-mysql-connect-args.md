@@ -460,7 +460,8 @@ test, run, confirm FAILED (not SKIPPED). Revert, confirm PASSED. Same drill as P
 
 Default CI count preservation: `pytest -q -m "not integration"` MUST be `519 baseline + 7 new
 adapter tests = 526` (or whatever the actual current default count is — verify at impl time)
-with the integration cases deselected count growing by 4 (mysql contract + 3 mysql integration).
+with the integration cases deselected count growing to 23. The 3 existing MySQL stubs were already
+integration-marked; P9a.1 activates those and adds 4 new MySQL contract cases.
 
 ---
 
@@ -470,7 +471,7 @@ Update `tests/integration/README.md` with new counts:
 
 ```
 With full integration extras + Docker:
-- pytest -q -m integration tests/   → 9 Postgres + 7 OpenBao + 4 MySQL = 20 collected, all pass
+- pytest -q -m integration tests/   → 9 Postgres + 7 OpenBao + 7 MySQL = 23 collected, all pass
 ```
 
 CI automation (GitHub Actions matrix with `services: postgres, mysql, openbao`) remains deferred

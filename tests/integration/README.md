@@ -15,15 +15,18 @@ Integration tests spin up real database/service containers via
    # OpenBao integration tests
    pip install -e ".[secrets-openbao,integration]"
 
-   # Both together
-   pip install -e ".[persistence-postgres,secrets-openbao,integration]"
+   # MySQL integration tests
+   pip install -e ".[persistence-mysql,integration]"
+
+   # All together
+   pip install -e ".[persistence-postgres,persistence-mysql,secrets-openbao,integration]"
    ```
 
 ## Running integration tests
 
 ```bash
-# Run all integration-marked tests (Postgres + OpenBao + postgres contract cases)
-# NOTE: use `tests/` NOT `tests/integration/` — the postgres contract cases
+# Run all integration-marked tests (Postgres + MySQL + OpenBao + contract cases)
+# NOTE: use `tests/` NOT `tests/integration/` — the SQLAlchemy contract cases
 # live in tests/contract/test_sessionstore_contract.py and would be missed
 # by a `tests/integration/`-only invocation.
 pytest -q -m integration tests/
@@ -32,10 +35,10 @@ pytest -q -m integration tests/
 Expected output (when Docker available, first run pulls images ~100MB):
 
 ```
-16 passed, 3 skipped in ~15s
+23 passed in ~20s
 ```
 
-The 16 integration-marked cases that PASS are:
+The 23 integration-marked cases that PASS are:
 - 7 in `tests/integration/test_openbao_secret_integration.py` (P9b)
   1. `test_get_secrets_returns_seeded_kv_v2_data` (happy path: seed + read)
   2. `test_get_secrets_returns_empty_on_unseeded_workspace` (HC-B: 404 → `{}`)
@@ -44,29 +47,32 @@ The 16 integration-marked cases that PASS are:
   5. `test_real_openbao_auth_error_does_not_leak_bad_token` (HC-D: bad sentinel absent from auth error)
   6. `test_real_network_error_does_not_leak_good_token` (HC-D: good sentinel absent from network error)
   7. `test_get_secrets_rejects_invalid_workspace_id_before_http` (HC-A: workspace_id validation before HTTP)
-- 5 in `tests/integration/test_sqlalchemy_session_store_integration.py`
+- 8 in `tests/integration/test_sqlalchemy_session_store_integration.py`
   1. `test_postgres_fixture_url_passes_p8e_validation`
   2. `test_concurrent_get_or_create_deterministically_triggers_integrity_error_on_postgres` (P1-#2 killer)
   3. `test_duplicate_mark_processed_does_not_break_subsequent_ops`
   4. `test_cross_restart_session_persists`
   5. `test_postgres_schema_argument_creates_tables_in_schema`
-- 4 in `tests/contract/test_sessionstore_contract.py` (sqlalchemy-postgres backend)
+  6. `test_mysql_end_to_end_crud_with_connect_args_auth`
+  7. `test_mysql_fresh_schema_create_only`
+  8. `test_mysql_cross_restart_durability`
+- 8 in `tests/contract/test_sessionstore_contract.py` (sqlalchemy-postgres + sqlalchemy-mysql backends)
   1. `test_get_or_create_idempotent[sqlalchemy-postgres]`
   2. `test_different_key_different_session[sqlalchemy-postgres]`
   3. `test_save_persists_turn[sqlalchemy-postgres]`
   4. `test_dedup_tracks_message_ids[sqlalchemy-postgres]`
-
-Additionally, 3 MySQL stubs (`test_mysql_*`) are collected and unconditionally
-`pytest.skip("-> P9a.1")`, bringing the total `pytest -m integration` collection
-count to **19 (16 pass + 3 skip)**.
+  5. `test_get_or_create_idempotent[sqlalchemy-mysql]`
+  6. `test_different_key_different_session[sqlalchemy-mysql]`
+  7. `test_save_persists_turn[sqlalchemy-mysql]`
+  8. `test_dedup_tracks_message_ids[sqlalchemy-mysql]`
 
 ## Three invocation forms
 
 | Command | Collected | Result | Docker needed |
 |---|---|---|---|
-| `pytest -q -m "not integration"` | 519 | 519 passed, 19 deselected | No |
-| `pytest -q -m integration tests/` | 19 | 16 passed, 3 skipped, 519 deselected | Yes |
-| `pytest -q` (no filter) | 538 | 535 passed, 3 skipped | Yes |
+| `pytest -q -m "not integration"` | 526 | 526 passed, 23 deselected | No |
+| `pytest -q -m integration tests/` | 23 | 23 passed, 526 deselected | Yes |
+| `pytest -q` (no filter) | 549 | 549 passed | Yes |
 
 ## Default CI
 
@@ -83,8 +89,11 @@ see sub-plan §2.4).
 
 ## Skip behaviour
 
-- If `testcontainers` is not installed: `openbao_container` / `postgres_container`
-  fixtures call `pytest.importorskip("testcontainers")` → clean Skipped (not error).
+- If `testcontainers` is not installed: `openbao_container` / `postgres_container` /
+  `mysql_container` fixtures call `pytest.importorskip("testcontainers")` → clean
+  Skipped (not error).
+- If `pymysql` is not installed: `mysql_container` calls
+  `pytest.importorskip("pymysql")` → MySQL integration cases skip cleanly.
 - If `requests` is not installed: `test_openbao_secret_integration.py` module-top
   `pytest.importorskip("requests")` → whole module skipped cleanly.
 - If Docker daemon is not available: container fixtures call
@@ -108,7 +117,7 @@ export DOCKER_HOST=unix:///Users/<you>/.colima/<instance>/docker.sock
 pytest -q -m integration tests/
 ```
 
-## Credential-free DSN (P8e HC-C compliance)
+## Credential-free DSN (P8e/P9a.1 HC-C compliance)
 
 The `postgres_url` fixture returns a DSN with **no embedded credentials**:
 ```
@@ -117,6 +126,13 @@ postgresql+psycopg://localhost:54321/test
 psycopg/libpq reads `PGUSER` and `PGPASSWORD` from environment variables at
 connect time. This is required by P8e HC-C which rejects DSNs with embedded
 `user:pass@`. See sub-plan §1.1 for full rationale.
+
+The `mysql_dsn_and_connect_args` fixture returns a two-channel tuple:
+```
+("mysql+pymysql://localhost:54322/claw_test", {"user": "claw_test", "password": "MYSQL-TEST-PW-DO-NOT-LEAK-AT-CONTAINER-LEVEL", ...})
+```
+The DSN remains credential-free; MySQL credentials are passed through
+`SQLAlchemySessionStore(..., connect_args=...)`.
 
 ## OpenBao integration (P9b)
 
@@ -146,12 +162,12 @@ OpenBao would require a fake-proxy layer, contradicting the "real backend" inten
 P8d's fake-HTTP unit tests in `tests/adapters/test_openbao_secret.py` cover that
 path comprehensively.
 
-## MySQL (deferred to P9a.1)
+## MySQL integration (P9a.1)
 
-MySQL integration tests are deferred. The credential-free DSN approach used
-for Postgres does not work for MySQL (`pymysql` does not read PGUSER/PGPASSWORD
-equivalents). P9a.1 adds `connect_args` to `SQLAlchemySessionStore.__init__`
-to unblock MySQL integration.
+MySQL tests use `mysql:8.0.36` with a credential-free DSN plus separate
+`connect_args` auth. The coverage includes end-to-end CRUD/idempotency, fresh
+schema idempotent initialization, cross-restart durability, and the shared
+SessionStore contract backend.
 
 ## CI automation (deferred)
 
