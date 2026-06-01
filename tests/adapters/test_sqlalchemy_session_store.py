@@ -7,9 +7,10 @@ Test gating: entire module is skipped if sqlalchemy is not installed.
 """
 from __future__ import annotations
 
+import os
 import threading
 import tempfile
-import os
+from types import MappingProxyType
 
 import pytest
 
@@ -27,6 +28,7 @@ from claw_engine.engine.persistence.contracts import SessionStore  # noqa: E402
 # ── Sentinel password used in HC-C tests ─────────────────────────────────────
 
 SENTINEL_PW = "PLAINTEXT-PW-DO-NOT-LEAK"
+CONNECT_ARGS_SENTINEL = "PLAINTEXT-CONNECT-ARGS-DO-NOT-LEAK"
 
 
 def assert_no_password_leak(text: str) -> None:
@@ -35,6 +37,24 @@ def assert_no_password_leak(text: str) -> None:
         f"Password leaked in output text. Offending string (truncated):\n"
         f"  {text[:300]!r}"
     )
+
+
+def assert_no_connect_args_leak(exc: SessionStoreError) -> None:
+    """Assert connect_args credentials do not appear in user-facing error surfaces."""
+    surfaces = {
+        "str": str(exc),
+        "repr": repr(exc),
+        "args": repr(exc.args),
+    }
+    for name, text in surfaces.items():
+        assert CONNECT_ARGS_SENTINEL not in text, (
+            f"connect_args credential leaked in {name}. "
+            f"Offending string (truncated): {text[:300]!r}"
+        )
+        assert "connect_args" not in text, (
+            f"connect_args label leaked in {name}. "
+            f"Offending string (truncated): {text[:300]!r}"
+        )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -147,6 +167,15 @@ def test_construction_rejects_url_with_credentials() -> None:
             SQLAlchemySessionStore(bad_url)
 
 
+def test_construction_rejects_mysql_dsn_with_credentials() -> None:
+    """HC-C layer 1: MySQL auth must use connect_args, not embedded URL creds."""
+    with pytest.raises(ValueError, match="credentials"):
+        SQLAlchemySessionStore(
+            "mysql+pymysql://user:secret@host/db",
+            connect_args={"user": "user", "password": "secret"},
+        )
+
+
 def test_construction_rejection_message_does_not_leak_password() -> None:
     """HC-C: the ValueError message from credential rejection must not echo the password."""
     bad_url = f"postgresql+psycopg://user:{SENTINEL_PW}@host/db"
@@ -173,6 +202,21 @@ def test_repr_does_not_leak_url_password() -> None:
     assert_no_password_leak(str_text)
     # SQLAlchemy's hide_password=True replaces password with ***
     assert "***" in repr_text or SENTINEL_PW not in repr_text
+
+
+def test_repr_does_not_leak_connect_args_credentials() -> None:
+    """HC-C layer 2: repr/str never advertise connect_args or their values."""
+    store = SQLAlchemySessionStore(
+        "mysql+pymysql://host/db",
+        connect_args={"user": "alice", "password": CONNECT_ARGS_SENTINEL},
+    )
+
+    repr_text = repr(store)
+    str_text = str(store)
+    assert CONNECT_ARGS_SENTINEL not in repr_text
+    assert CONNECT_ARGS_SENTINEL not in str_text
+    assert "connect_args" not in repr_text
+    assert "connect_args" not in str_text
 
 
 @pytest.mark.parametrize(
@@ -264,6 +308,75 @@ def test_construction_accepts_valid_schema() -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Lazy connection / engine management
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_connect_args_default_none_does_not_pass_to_create_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P9a.1: omitting connect_args preserves the pre-existing create_engine call."""
+    original_create_engine = sqlalchemy.create_engine
+    captured_kwargs: list[dict[str, object]] = []
+
+    def spy_create_engine(url, **kwargs):
+        captured_kwargs.append(dict(kwargs))
+        return original_create_engine(url)
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", spy_create_engine)
+
+    store = SQLAlchemySessionStore("sqlite:///:memory:")
+    store._ensure_engine()
+
+    assert captured_kwargs == [{}]
+    assert "connect_args" not in captured_kwargs[0]
+
+
+def test_connect_args_non_none_passes_dict_to_create_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P9a.1: non-None connect_args is passed through at engine creation."""
+    original_create_engine = sqlalchemy.create_engine
+    captured_kwargs: list[dict[str, object]] = []
+
+    def spy_create_engine(url, **kwargs):
+        captured_kwargs.append(dict(kwargs))
+        # The assertion is about adapter wiring; use a normal sqlite engine so
+        # create_all remains independent of driver-specific connect args.
+        return original_create_engine(url)
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", spy_create_engine)
+
+    store = SQLAlchemySessionStore(
+        "sqlite:///:memory:",
+        connect_args={"k": "v"},
+    )
+    store._ensure_engine()
+
+    assert captured_kwargs == [{"connect_args": {"k": "v"}}]
+
+
+def test_connect_args_is_defensively_copied() -> None:
+    """P9a.1: caller mutations after construction cannot alter adapter state."""
+    connect_args = {"user": "alice", "password": "initial"}
+    store = SQLAlchemySessionStore(
+        "mysql+pymysql://host/db",
+        connect_args=connect_args,
+    )
+
+    connect_args["password"] = "mutated"
+
+    assert store._connect_args == {"user": "alice", "password": "initial"}
+
+
+def test_connect_args_accepts_mapping_not_just_dict() -> None:
+    """P9a.1: read-only Mapping inputs are accepted and normalized to dict."""
+    connect_args = MappingProxyType({"user": "alice", "password": "secret"})
+    store = SQLAlchemySessionStore(
+        "mysql+pymysql://host/db",
+        connect_args=connect_args,
+    )
+
+    assert store._connect_args == {"user": "alice", "password": "secret"}
+    assert type(store._connect_args) is dict
 
 
 def test_first_call_creates_engine() -> None:
@@ -908,6 +1021,40 @@ def test_ensure_engine_init_error_does_not_leak_password() -> None:
         store._ensure_engine()
     assert_no_password_leak(str(exc_info.value))
     assert_no_password_leak(repr(exc_info.value))
+
+
+def test_init_failure_does_not_leak_connect_args_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HC-C layer 2: wrapped init errors do not echo connect_args values or label.
+
+    The no-leak surface is the adapter-facing exception only: str, repr, and
+    args. The __cause__ chain is intentionally outside this assertion.
+    """
+
+    def boom_create_engine(*args, **kwargs):
+        assert kwargs["connect_args"]["password"] == CONNECT_ARGS_SENTINEL
+        raise sqlalchemy.exc.OperationalError(
+            "simulated",
+            None,
+            Exception(CONNECT_ARGS_SENTINEL),
+        )
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", boom_create_engine)
+
+    store = SQLAlchemySessionStore(
+        "mysql+pymysql://127.0.0.1:1/db",
+        connect_args={
+            "user": "alice",
+            "password": CONNECT_ARGS_SENTINEL,
+            "connect_timeout": 1,
+        },
+    )
+    with pytest.raises(SessionStoreError) as exc_info:
+        store.get_or_create(**_KW)
+
+    assert exc_info.value.stage == "init"
+    assert_no_connect_args_leak(exc_info.value)
 
 
 def test_ensure_engine_disposes_half_built_engine_on_failure(

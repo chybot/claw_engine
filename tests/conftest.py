@@ -39,6 +39,12 @@ OpenBao fixtures (P9b):
   - _TEST_BAD_TOKEN_SENTINEL: the BAD sentinel; transmitted in auth-error tests
   Both are shaped distinctly enough to grep without false positives.
   HC-D tests scan the sentinel that was ACTUALLY TRANSMITTED in the failing request.
+
+MySQL fixtures (P9a.1):
+  mysql_container and mysql_dsn_and_connect_args follow the same unconditional
+  definition pattern as Postgres/OpenBao. The fixture returns a credential-free
+  DSN plus a separate connect_args dict because HC-C rejects credentials embedded
+  in URLs and pymysql has no PGUSER/PGPASSWORD-style fallback.
 """
 from __future__ import annotations
 
@@ -50,6 +56,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 if TYPE_CHECKING:  # pragma: no cover — type-only import
+    from testcontainers.mysql import MySqlContainer
     from testcontainers.postgres import PostgresContainer
     from testcontainers.vault import VaultContainer
 
@@ -65,6 +72,12 @@ _POSTGRES_IMAGE = "postgres:16.4-alpine"
 # OpenBao image — pinned to 2.0.0 (verified published at implementation time).
 # openbao/openbao:2.0.0 is the official release; bump explicitly if needed.
 _OPENBAO_IMAGE = "openbao/openbao:2.0.0"
+
+# MySQL image — pinned to 8.0.36 (P9a.1 locked minor).
+_MYSQL_IMAGE = "mysql:8.0.36"
+_MYSQL_TEST_USER = "claw_test"
+_MYSQL_TEST_PASSWORD = "MYSQL-TEST-PW-DO-NOT-LEAK-AT-CONTAINER-LEVEL"
+_MYSQL_TEST_DBNAME = "claw_test"
 
 # Two sentinel tokens for OpenBao HC-D leakage tests.
 # Shaped distinctly enough to grep across logs/CI output without false positives.
@@ -202,6 +215,76 @@ def unique_table_prefix() -> str:
     No testcontainers dependency — safe to use independent of Docker.
     """
     return f"test_{uuid.uuid4().hex[:8]}_"
+
+
+# ---------------------------------------------------------------------------
+# MySQL fixtures (P9a.1) — UNCONDITIONAL definitions; gating inside body
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def mysql_container() -> Iterator["MySqlContainer"]:
+    """Start a MySQL 8 container once per pytest session.
+
+    Image: mysql:8.0.36 (pinned minor — see _MYSQL_IMAGE).
+
+    Skip behaviour mirrors postgres_container:
+      - testcontainers not installed → importorskip → clean Skipped
+      - pymysql not installed → importorskip → clean Skipped
+      - Docker daemon unreachable or container startup failure → pytest.skip
+    """
+    pytest.importorskip(
+        "testcontainers",
+        reason=(
+            "testcontainers not installed — MySQL integration tests require Docker. "
+            "Install with: pip install -e '.[persistence-mysql,integration]'"
+        ),
+    )
+    pytest.importorskip(
+        "pymysql",
+        reason=(
+            "pymysql not installed — MySQL integration tests require the MySQL "
+            "adapter extra. Install with: pip install -e "
+            "'.[persistence-mysql,integration]'"
+        ),
+    )
+
+    from testcontainers.core.config import testcontainers_config as tc_config
+    from testcontainers.mysql import MySqlContainer
+
+    tc_config.max_tries = int(_TC_TIMEOUT / max(tc_config.sleep_time, 0.1))
+
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    if docker_host and "/var/run/docker.sock" not in docker_host:
+        tc_config.ryuk_disabled = True
+
+    try:
+        container = MySqlContainer(
+            image=_MYSQL_IMAGE,
+            username=_MYSQL_TEST_USER,
+            password=_MYSQL_TEST_PASSWORD,
+            dbname=_MYSQL_TEST_DBNAME,
+        )
+        with container as c:
+            yield c
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"Docker daemon not available or MySQL container failed: {exc}")
+
+
+@pytest.fixture
+def mysql_dsn_and_connect_args(
+    mysql_container: "MySqlContainer",
+) -> tuple[str, dict[str, Any]]:
+    """Return credential-free MySQL DSN plus separate connect_args credentials."""
+    host = mysql_container.get_container_host_ip()
+    port = mysql_container.get_exposed_port(3306)
+    dsn = f"mysql+pymysql://{host}:{port}/{_MYSQL_TEST_DBNAME}"
+    connect_args = {
+        "user": _MYSQL_TEST_USER,
+        "password": _MYSQL_TEST_PASSWORD,
+        "connect_timeout": 10,
+    }
+    return dsn, connect_args
 
 
 # Silence unused-import warning when TYPE_CHECKING is False at runtime.
