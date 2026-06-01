@@ -240,7 +240,7 @@ def mysql_container() -> Iterator["MySqlContainer"]:
         reason="testcontainers not installed (pip install -e .[integration])",
     )
     from testcontainers.mysql import MySqlContainer
-    
+
     try:
         container = MySqlContainer(
             image=_MYSQL_IMAGE,   # "mysql:8.0.36" pinned minor
@@ -257,7 +257,7 @@ def mysql_container() -> Iterator["MySqlContainer"]:
 @pytest.fixture
 def mysql_dsn_and_connect_args(mysql_container) -> tuple[str, dict[str, Any]]:
     """Returns credential-free DSN + connect_args for MySQL.
-    
+
     P8e HC-C rejects user:pass@ in URL. testcontainers' get_connection_url()
     returns the user:pass@ form, so we construct our own credential-free URL
     and pass credentials via connect_args (the legitimate channel for MySQL,
